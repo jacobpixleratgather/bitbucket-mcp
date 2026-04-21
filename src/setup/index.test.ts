@@ -1,0 +1,378 @@
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { PassThrough } from "node:stream";
+import { afterEach, beforeEach, expect, test, vi } from "vite-plus/test";
+import type { RepoTarget, StoredTokens } from "../types.ts";
+import { promptMaskedInput, runSetup } from "./index.ts";
+
+let tmpDir: string;
+let originalXdg: string | undefined;
+
+beforeEach(() => {
+  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "bbmcp-setup-"));
+  originalXdg = process.env["XDG_CONFIG_HOME"];
+  process.env["XDG_CONFIG_HOME"] = tmpDir;
+});
+
+afterEach(() => {
+  if (originalXdg === undefined) {
+    delete process.env["XDG_CONFIG_HOME"];
+  } else {
+    process.env["XDG_CONFIG_HOME"] = originalXdg;
+  }
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+function collect(stream: PassThrough): { text: () => string } {
+  const chunks: string[] = [];
+  stream.on("data", (c: Buffer | string) => {
+    chunks.push(typeof c === "string" ? c : c.toString("utf8"));
+  });
+  return { text: () => chunks.join("") };
+}
+
+// readline buffers its input in a way that only the first line is immediately
+// consumed when the stream is a PassThrough fed synchronously. Feeding one line
+// per tick reliably drives a sequence of question() calls.
+function script(stdin: PassThrough, lines: string[]): void {
+  const queue = lines.slice();
+  const feed = (): void => {
+    const next = queue.shift();
+    if (next === undefined) return;
+    stdin.write(`${next}\n`);
+    setImmediate(feed);
+  };
+  feed();
+}
+
+function sampleTokens(): StoredTokens {
+  return {
+    accessToken: "acc",
+    refreshToken: "ref",
+    expiresAt: Date.now() + 3600_000,
+    scopes: ["account", "repository", "pullrequest"],
+  };
+}
+
+// ---------- Masked input ----------
+
+test("promptMaskedInput reads input without echoing on non-TTY", async () => {
+  const stdin = new PassThrough() as PassThrough & { isTTY?: boolean };
+  const stdout = new PassThrough();
+  const out = collect(stdout);
+
+  // PassThrough has no isTTY → the helper must fall back to line mode.
+  stdin.isTTY = false;
+
+  setImmediate(() => {
+    stdin.write("super-secret\n");
+  });
+
+  const value = await promptMaskedInput({
+    stdin,
+    stdout,
+    prompt: "Secret: ",
+  });
+
+  expect(value).toBe("super-secret");
+
+  // The prompt label should appear, but NOT the secret itself.
+  const text = out.text();
+  expect(text).toContain("Secret:");
+  expect(text).not.toContain("super-secret");
+});
+
+// ---------- Injection points ----------
+
+test("runSetup uses injected openBrowser, inferRepo, and binPath", async () => {
+  const stdin = new PassThrough();
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  const out = collect(stdout);
+
+  script(stdin, ["", "k", "s"]);
+
+  const openBrowser = vi.fn(async (_url: string) => undefined);
+  const inferRepo = vi.fn(
+    async (): Promise<RepoTarget | null> => ({
+      workspace: "my-ws",
+      repo: "my-repo",
+    }),
+  );
+  const runAuthorizationFlow = vi.fn(async () => sampleTokens());
+
+  await runSetup({
+    stdin,
+    stdout,
+    stderr,
+    openBrowser,
+    inferRepo,
+    binPath: "/custom/path/bitbucket-mcp.mjs",
+    runAuthorizationFlow:
+      runAuthorizationFlow as unknown as typeof import("../auth/index.ts").runAuthorizationFlow,
+  });
+
+  expect(inferRepo).toHaveBeenCalled();
+  expect(out.text()).toContain("/custom/path/bitbucket-mcp.mjs");
+});
+
+// ---------- Scope verification ----------
+
+const FULL_SCOPES: readonly string[] = [
+  "account",
+  "repository",
+  "pullrequest",
+  "pullrequest:write",
+  "pipeline",
+];
+
+test("scope warning is printed when a required scope is missing", async () => {
+  const stdin = new PassThrough();
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  const out = collect(stdout);
+
+  script(stdin, ["", "k", "s"]);
+
+  const runAuthorizationFlow = vi.fn(async () => ({
+    accessToken: "a",
+    refreshToken: "r",
+    expiresAt: Date.now() + 3600_000,
+    scopes: ["account", "repository", "pullrequest", "pipeline"], // missing pullrequest:write
+  }));
+
+  await runSetup({
+    stdin,
+    stdout,
+    stderr,
+    openBrowser: vi.fn(async () => undefined),
+    inferRepo: vi.fn(async () => null),
+    runAuthorizationFlow:
+      runAuthorizationFlow as unknown as typeof import("../auth/index.ts").runAuthorizationFlow,
+  });
+
+  const text = out.text();
+  expect(text).toContain("missing scope");
+  expect(text).toContain("pullrequest:write");
+});
+
+test("no scope warning when all required scopes are granted", async () => {
+  const stdin = new PassThrough();
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  const out = collect(stdout);
+
+  script(stdin, ["", "k", "s"]);
+
+  const runAuthorizationFlow = vi.fn(async () => ({
+    accessToken: "a",
+    refreshToken: "r",
+    expiresAt: Date.now() + 3600_000,
+    scopes: FULL_SCOPES.slice(),
+  }));
+
+  await runSetup({
+    stdin,
+    stdout,
+    stderr,
+    openBrowser: vi.fn(async () => undefined),
+    inferRepo: vi.fn(async () => null),
+    runAuthorizationFlow:
+      runAuthorizationFlow as unknown as typeof import("../auth/index.ts").runAuthorizationFlow,
+  });
+
+  expect(out.text()).not.toContain("missing scope");
+});
+
+// ---------- Step structure ----------
+
+test("step 1 opens the workspace-specific consumers page when repo is inferred", async () => {
+  const stdin = new PassThrough();
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  const out = collect(stdout);
+
+  script(stdin, ["", "k", "s"]);
+
+  const openBrowser = vi.fn(async (_url: string) => undefined);
+  const inferRepo = vi.fn(async () => ({ workspace: "acme", repo: "web" }));
+  const runAuthorizationFlow = vi.fn(async () => sampleTokens());
+
+  await runSetup({
+    stdin,
+    stdout,
+    stderr,
+    openBrowser,
+    inferRepo,
+    runAuthorizationFlow:
+      runAuthorizationFlow as unknown as typeof import("../auth/index.ts").runAuthorizationFlow,
+  });
+
+  expect(openBrowser).toHaveBeenCalledTimes(1);
+  expect(openBrowser).toHaveBeenCalledWith(
+    "https://bitbucket.org/acme/workspace/settings/oauth-consumers",
+  );
+  expect(out.text()).toContain("https://bitbucket.org/acme/workspace/settings/oauth-consumers");
+});
+
+test("step 1 opens the generic workspaces page when repo inference returns null", async () => {
+  const stdin = new PassThrough();
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+
+  script(stdin, ["", "k", "s"]);
+
+  const openBrowser = vi.fn(async (_url: string) => undefined);
+  const inferRepo = vi.fn(async () => null);
+  const runAuthorizationFlow = vi.fn(async () => sampleTokens());
+
+  await runSetup({
+    stdin,
+    stdout,
+    stderr,
+    openBrowser,
+    inferRepo,
+    runAuthorizationFlow:
+      runAuthorizationFlow as unknown as typeof import("../auth/index.ts").runAuthorizationFlow,
+  });
+
+  expect(openBrowser).toHaveBeenCalledWith("https://bitbucket.org/account/workspaces/");
+});
+
+test("step 2 prompt for credentials appears only after user presses Enter on step 1", async () => {
+  const stdin = new PassThrough();
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+
+  const events: string[] = [];
+  stdout.on("data", (chunk: Buffer | string) => {
+    const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+    if (text.includes("Step 1 of 3")) events.push("step1-header");
+    if (text.includes("Step 2 of 3")) events.push("step2-header");
+    if (text.includes("Key:")) events.push("key-prompt");
+  });
+
+  script(stdin, ["", "my-key", "my-secret"]);
+
+  const openBrowser = vi.fn(async (_url: string) => undefined);
+  const inferRepo = vi.fn(async () => null);
+  const runAuthorizationFlow = vi.fn(async () => sampleTokens());
+
+  await runSetup({
+    stdin,
+    stdout,
+    stderr,
+    openBrowser,
+    inferRepo,
+    runAuthorizationFlow:
+      runAuthorizationFlow as unknown as typeof import("../auth/index.ts").runAuthorizationFlow,
+  });
+
+  expect(events).toContain("step1-header");
+  expect(events).toContain("step2-header");
+  expect(events).toContain("key-prompt");
+  expect(events.indexOf("step1-header")).toBeLessThan(events.indexOf("step2-header"));
+  expect(events.indexOf("step2-header")).toBeLessThanOrEqual(events.indexOf("key-prompt"));
+});
+
+// ---------- Happy path ----------
+
+test("runSetup writes creds, calls runAuthorizationFlow, prints success", async () => {
+  const stdin = new PassThrough();
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  const out = collect(stdout);
+
+  script(stdin, ["", "my-key", "my-secret"]);
+
+  const runAuthorizationFlow = vi.fn(async () => sampleTokens());
+
+  await runSetup({
+    stdin,
+    stdout,
+    stderr,
+    openBrowser: vi.fn(async () => undefined),
+    inferRepo: vi.fn(async () => null),
+    runAuthorizationFlow:
+      runAuthorizationFlow as unknown as typeof import("../auth/index.ts").runAuthorizationFlow,
+  });
+
+  // Config should have been written with the provided client key/secret.
+  const cfgPath = path.join(tmpDir, "bitbucket-mcp", "config.json");
+  const saved = JSON.parse(fs.readFileSync(cfgPath, "utf8")) as {
+    clientKey: string;
+    clientSecret: string;
+  };
+  expect(saved.clientKey).toBe("my-key");
+  expect(saved.clientSecret).toBe("my-secret");
+
+  expect(runAuthorizationFlow).toHaveBeenCalledWith({
+    clientKey: "my-key",
+    clientSecret: "my-secret",
+  });
+
+  const output = out.text();
+  expect(output).toContain("bitbucket-mcp setup");
+  expect(output).toContain("Authentication complete");
+  expect(output).toContain("account, repository, pullrequest");
+});
+
+// ---------- Empty input re-prompts ----------
+
+test("empty client key re-prompts until non-empty", async () => {
+  const stdin = new PassThrough();
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+
+  // Blank newline, blank-only, then actual key.
+  // Sequence of answers: [initial Enter, "", "   ", "real-key", "real-secret"]
+  script(stdin, ["", "", "   ", "real-key", "real-secret"]);
+
+  const runAuthorizationFlow = vi.fn(async () => sampleTokens());
+
+  await runSetup({
+    stdin,
+    stdout,
+    stderr,
+    openBrowser: vi.fn(async () => undefined),
+    inferRepo: vi.fn(async () => null),
+    runAuthorizationFlow:
+      runAuthorizationFlow as unknown as typeof import("../auth/index.ts").runAuthorizationFlow,
+  });
+
+  expect(runAuthorizationFlow).toHaveBeenCalledWith({
+    clientKey: "real-key",
+    clientSecret: "real-secret",
+  });
+});
+
+// ---------- Failure path ----------
+
+test("runAuthorizationFlow throwing causes runSetup to throw and print error", async () => {
+  const stdin = new PassThrough();
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  const errOut = collect(stderr);
+
+  script(stdin, ["", "k", "s"]);
+
+  const runAuthorizationFlow = vi.fn(async () => {
+    throw new Error("browser flow failed");
+  });
+
+  await expect(
+    runSetup({
+      stdin,
+      stdout,
+      stderr,
+      openBrowser: vi.fn(async () => undefined),
+      inferRepo: vi.fn(async () => null),
+      runAuthorizationFlow:
+        runAuthorizationFlow as unknown as typeof import("../auth/index.ts").runAuthorizationFlow,
+    }),
+  ).rejects.toThrow("browser flow failed");
+
+  expect(errOut.text()).toContain("Setup failed");
+  expect(errOut.text()).toContain("browser flow failed");
+});

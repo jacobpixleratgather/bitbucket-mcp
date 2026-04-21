@@ -1,0 +1,49 @@
+{
+  "name": "bitbucket-mcp",
+  "version": "0.1.0",
+  "description": "A local stdio MCP server for Bitbucket Cloud",
+  "keywords": [
+    "bitbucket",
+    "claude",
+    "llm",
+    "mcp",
+    "model-context-protocol"
+  ],
+  "license": "MIT",
+  "bin": {
+    "bitbucket-mcp": "./dist/bitbucket-mcp.mjs"
+  },
+  "files": [
+    "dist"
+  ],
+  "type": "module",
+  "exports": {
+    ".": "./dist/bitbucket-mcp.mjs",
+    "./package.json": "./package.json"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "vp pack",
+    "dev": "vp pack --watch",
+    "test": "vp test",
+    "check": "vp check",
+    "prepublishOnly": "vp run build",
+    "prepare": "vp config",
+    "mcp:setup": "node -e \"console.log('Open Claude Code in this directory and run /setup.\\n(Or, without Claude Code: ./dist/bitbucket-mcp.mjs setup)')\""
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "open": "^10.2.0",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "@typescript/native-preview": "7.0.0-dev.20260328.1",
+    "bumpp": "^11.0.1",
+    "typescript": "^6.0.2",
+    "vite-plus": "^0.1.14"
+  },
+  "packageManager": "pnpm@10.33.0"
+}
