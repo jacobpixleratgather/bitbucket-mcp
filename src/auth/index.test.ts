@@ -4,7 +4,7 @@ import * as path from "node:path";
 import { afterEach, beforeEach, expect, test, vi } from "vite-plus/test";
 import { readConfig, writeConfig } from "../config/index.ts";
 import { AuthError, type StoredTokens } from "../types.ts";
-import { forceRefresh, getAccessToken, runAuthorizationFlow } from "./index.ts";
+import { CALLBACK_PORT, forceRefresh, getAccessToken, runAuthorizationFlow } from "./index.ts";
 
 type Call = {
   url: string;
@@ -311,19 +311,8 @@ test("forceRefresh: non-2xx clears tokens and throws with body", async () => {
 // runAuthorizationFlow
 // -----------------------------
 
-function parsePortAndState(authorizeUrl: string): {
-  port: number;
-  state: string;
-  redirectUri: string;
-} {
-  const u = new URL(authorizeUrl);
-  const state = u.searchParams.get("state") ?? "";
-  const redirectUri = u.searchParams.get("redirect_uri") ?? "";
-  const m = redirectUri.match(/:(\d+)\/callback$/);
-  if (m === null) {
-    throw new Error(`could not parse port from redirect_uri: ${redirectUri}`);
-  }
-  return { port: Number.parseInt(m[1]!, 10), state, redirectUri };
+function parseState(authorizeUrl: string): string {
+  return new URL(authorizeUrl).searchParams.get("state") ?? "";
 }
 
 test("runAuthorizationFlow: happy path — exchanges code, persists tokens", async () => {
@@ -344,12 +333,12 @@ test("runAuthorizationFlow: happy path — exchanges code, persists tokens", asy
 
   const openBrowser = async (url: string): Promise<undefined> => {
     capturedUrl = url;
-    const { port, state } = parsePortAndState(url);
+    const state = parseState(url);
     // Fire off the callback asynchronously so waitForCallback is installed.
     setImmediate(() => {
       void globalThis
         .fetch(
-          `http://127.0.0.1:${port}/callback?code=auth-code&state=${encodeURIComponent(state)}`,
+          `http://127.0.0.1:${CALLBACK_PORT}/callback?code=auth-code&state=${encodeURIComponent(state)}`,
         )
         .catch(() => {
           // Ignored — the server may close between response and body consumption.
@@ -394,7 +383,7 @@ test("runAuthorizationFlow: happy path — exchanges code, persists tokens", asy
   expect(call.headers["authorization"]).toBe(expectedBasic);
   expect(call.body).toContain("grant_type=authorization_code");
   expect(call.body).toContain("code=auth-code");
-  expect(call.body).toMatch(/redirect_uri=http%3A%2F%2F127\.0\.0\.1%3A\d+%2Fcallback/);
+  expect(call.body).not.toContain("redirect_uri");
 
   // Persisted.
   const cfg = await readConfig();
@@ -406,11 +395,13 @@ test("runAuthorizationFlow: authorize URL state matches the state sent back", as
   const { fetch: f } = makeScriptedFetch([{ status: 200, body: tokenBody() }]);
 
   const openBrowser = async (url: string): Promise<undefined> => {
-    const { port, state } = parsePortAndState(url);
+    const state = parseState(url);
     // Confirm we're round-tripping the same state we extracted from the URL.
     setImmediate(() => {
       void globalThis
-        .fetch(`http://127.0.0.1:${port}/callback?code=c&state=${encodeURIComponent(state)}`)
+        .fetch(
+          `http://127.0.0.1:${CALLBACK_PORT}/callback?code=c&state=${encodeURIComponent(state)}`,
+        )
         .then(() => {
           statesMatch = true;
         })
@@ -433,12 +424,13 @@ test("runAuthorizationFlow: authorize URL state matches the state sent back", as
 test("runAuthorizationFlow: state mismatch rejects and does not exchange", async () => {
   const { fetch: f, calls } = makeScriptedFetch([]);
 
-  const openBrowser = async (url: string): Promise<undefined> => {
-    const { port } = parsePortAndState(url);
+  const openBrowser = async (): Promise<undefined> => {
     setImmediate(() => {
-      void globalThis.fetch(`http://127.0.0.1:${port}/callback?code=c&state=WRONG`).catch(() => {
-        // Ignored.
-      });
+      void globalThis
+        .fetch(`http://127.0.0.1:${CALLBACK_PORT}/callback?code=c&state=WRONG`)
+        .catch(() => {
+          // Ignored.
+        });
     });
     return undefined;
   };
@@ -457,12 +449,11 @@ test("runAuthorizationFlow: state mismatch rejects and does not exchange", async
 test("runAuthorizationFlow: Bitbucket ?error=... rejects with AuthError including error text", async () => {
   const { fetch: f, calls } = makeScriptedFetch([]);
 
-  const openBrowser = async (url: string): Promise<undefined> => {
-    const { port } = parsePortAndState(url);
+  const openBrowser = async (): Promise<undefined> => {
     setImmediate(() => {
       void globalThis
         .fetch(
-          `http://127.0.0.1:${port}/callback?error=access_denied&error_description=${encodeURIComponent("User declined")}`,
+          `http://127.0.0.1:${CALLBACK_PORT}/callback?error=access_denied&error_description=${encodeURIComponent("User declined")}`,
         )
         .catch(() => {
           // Ignored.
@@ -486,10 +477,10 @@ test("runAuthorizationFlow: missing code rejects", async () => {
   const { fetch: f, calls } = makeScriptedFetch([]);
 
   const openBrowser = async (url: string): Promise<undefined> => {
-    const { port, state } = parsePortAndState(url);
+    const state = parseState(url);
     setImmediate(() => {
       void globalThis
-        .fetch(`http://127.0.0.1:${port}/callback?state=${encodeURIComponent(state)}`)
+        .fetch(`http://127.0.0.1:${CALLBACK_PORT}/callback?state=${encodeURIComponent(state)}`)
         .catch(() => {
           // Ignored.
         });
@@ -512,10 +503,12 @@ test("runAuthorizationFlow: token exchange 4xx rejects with body", async () => {
   const { fetch: f } = makeScriptedFetch([{ status: 400, body: "invalid_grant: bad code" }]);
 
   const openBrowser = async (url: string): Promise<undefined> => {
-    const { port, state } = parsePortAndState(url);
+    const state = parseState(url);
     setImmediate(() => {
       void globalThis
-        .fetch(`http://127.0.0.1:${port}/callback?code=c&state=${encodeURIComponent(state)}`)
+        .fetch(
+          `http://127.0.0.1:${CALLBACK_PORT}/callback?code=c&state=${encodeURIComponent(state)}`,
+        )
         .catch(() => {
           // Ignored.
         });
@@ -559,10 +552,12 @@ test("runAuthorizationFlow: openBrowser is called with the authorize URL", async
 
   const openBrowser = async (url: string): Promise<undefined> => {
     seen.push(url);
-    const { port, state } = parsePortAndState(url);
+    const state = parseState(url);
     setImmediate(() => {
       void globalThis
-        .fetch(`http://127.0.0.1:${port}/callback?code=c&state=${encodeURIComponent(state)}`)
+        .fetch(
+          `http://127.0.0.1:${CALLBACK_PORT}/callback?code=c&state=${encodeURIComponent(state)}`,
+        )
         .catch(() => {
           // Ignored.
         });
@@ -587,10 +582,12 @@ test("runAuthorizationFlow: if openBrowser throws, flow still completes (URL log
   // Capture from outside openBrowser via closure — we set it before throwing.
   const openBrowser = async (url: string): Promise<undefined> => {
     capturedUrl = url;
-    const { port, state } = parsePortAndState(url);
+    const state = parseState(url);
     setImmediate(() => {
       void globalThis
-        .fetch(`http://127.0.0.1:${port}/callback?code=c&state=${encodeURIComponent(state)}`)
+        .fetch(
+          `http://127.0.0.1:${CALLBACK_PORT}/callback?code=c&state=${encodeURIComponent(state)}`,
+        )
         .catch(() => {
           // Ignored.
         });

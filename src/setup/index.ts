@@ -1,7 +1,10 @@
 import * as nodePath from "node:path";
 import * as readline from "node:readline/promises";
 import open from "open";
-import { runAuthorizationFlow as defaultRunAuthorizationFlow } from "../auth/index.ts";
+import {
+  CALLBACK_PORT,
+  runAuthorizationFlow as defaultRunAuthorizationFlow,
+} from "../auth/index.ts";
 import { configPath, writeConfig } from "../config/index.ts";
 import { inferBitbucketRepo as defaultInferBitbucketRepo } from "../git/index.ts";
 import type { RepoTarget } from "../types.ts";
@@ -45,15 +48,16 @@ function step1Instructions(consumerUrl: string, includePickWorkspaceHint: boolea
     'Click "Add consumer" and fill in this form exactly:',
     "",
     "  Name:                          bitbucket-mcp",
-    "  Callback URL:                  http://127.0.0.1/*",
+    `  Callback URL:                  http://127.0.0.1:${CALLBACK_PORT}/callback`,
     "  ✓ This is a private consumer",
     "",
     "  Permissions (tick these five):",
     "    ✓ Account        → Read",
-    "    ✓ Repositories   → Read",
-    "    ✓ Pull requests  → Read",
     "    ✓ Pull requests  → Write",
     "    ✓ Pipelines      → Read",
+    "    ✓ Repositories   → Read (should be set because of Pull request: Write access)",
+    "    ✓ Repositories   → Write (should be set because of Pull request: Write access)",
+    "    ✓ Pull requests  → Read (should be set because of Pull request: Write access)",
     "",
     "Click Save. Bitbucket will show you a Key and a Secret.",
     "",
