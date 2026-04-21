@@ -68,6 +68,44 @@ For non-Claude-Code MCP hosts, use the absolute path to `dist/bitbucket-mcp.mjs`
 }
 ```
 
+## Setup (team — shared OAuth consumer)
+
+If your team already has a Bitbucket OAuth consumer registered, you don't need to create another one. Get the **Key** and **Secret** from your team's password manager, then run these four steps:
+
+**1. Clone and build**
+
+```bash
+git clone <this-repo-url>
+cd bitbucket-mcp
+vp install
+vp pack
+```
+
+**2. Load the shared credentials** (secret piped in to avoid shell history)
+
+```bash
+echo "<SECRET>" | ./dist/bitbucket-mcp.mjs credentials --key <KEY>
+
+# Or via env var if your vault can inject it:
+BITBUCKET_CLIENT_SECRET=<SECRET> ./dist/bitbucket-mcp.mjs credentials --key <KEY>
+```
+
+**3. Authorize with your own Bitbucket account**
+
+```bash
+./dist/bitbucket-mcp.mjs authorize
+# Opens browser → click "Grant access" → tokens saved to ~/.config/bitbucket-mcp/config.json
+```
+
+**4. Register with Claude Code**
+
+```bash
+./dist/bitbucket-mcp.mjs print-config --mcp-add-json \
+  | claude mcp add-json bitbucket --scope user -
+```
+
+Everyone shares the same OAuth consumer (key + secret) but each developer authorizes independently and gets their own personal access/refresh tokens in `~/.config/bitbucket-mcp/config.json`.
+
 ## Config file
 
 Stored at `$XDG_CONFIG_HOME/bitbucket-mcp/config.json` if `XDG_CONFIG_HOME` is set, otherwise `~/.config/bitbucket-mcp/config.json`. Mode `0600`; parent dir mode `0700`.
