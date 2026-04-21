@@ -9,6 +9,7 @@ const TOKEN_URL = "https://bitbucket.org/site/oauth2/access_token";
 const AUTHORIZE_URL = "https://bitbucket.org/site/oauth2/authorize";
 const REFRESH_SAFETY_MARGIN_MS = 60_000;
 const DEFAULT_AUTH_TIMEOUT_MS = 5 * 60 * 1000;
+export const CALLBACK_PORT = 7522;
 
 type FetchLike = typeof fetch;
 
@@ -118,13 +119,11 @@ export async function runAuthorizationFlow(opts: {
   });
 
   try {
-    const port = await listenOnLocalhost(server);
-    const redirectUri = `http://127.0.0.1:${port}/callback`;
+    await listenOnLocalhost(server);
 
     const authorizeUrl = buildAuthorizeUrl({
       clientKey: opts.clientKey,
       state,
-      redirectUri,
     });
 
     const callbackResult = waitForCallback({
@@ -148,7 +147,6 @@ export async function runAuthorizationFlow(opts: {
       clientKey: opts.clientKey,
       clientSecret: opts.clientSecret,
       code,
-      redirectUri,
       fetch: fetchImpl,
       now,
     });
@@ -176,7 +174,7 @@ async function listenOnLocalhost(server: http.Server): Promise<number> {
     };
     server.once("error", onError);
     server.once("listening", onListening);
-    server.listen(0, "127.0.0.1");
+    server.listen(CALLBACK_PORT, "127.0.0.1");
   });
 }
 
@@ -192,12 +190,11 @@ async function closeServer(server: http.Server): Promise<void> {
   });
 }
 
-function buildAuthorizeUrl(p: { clientKey: string; state: string; redirectUri: string }): string {
+function buildAuthorizeUrl(p: { clientKey: string; state: string }): string {
   const params = new URLSearchParams();
   params.set("client_id", p.clientKey);
   params.set("response_type", "code");
   params.set("state", p.state);
-  params.set("redirect_uri", p.redirectUri);
   return `${AUTHORIZE_URL}?${params.toString()}`;
 }
 
@@ -298,14 +295,12 @@ async function exchangeCode(p: {
   clientKey: string;
   clientSecret: string;
   code: string;
-  redirectUri: string;
   fetch: FetchLike;
   now: () => number;
 }): Promise<StoredTokens> {
   const body = new URLSearchParams();
   body.set("grant_type", "authorization_code");
   body.set("code", p.code);
-  body.set("redirect_uri", p.redirectUri);
 
   const response = await p.fetch(TOKEN_URL, {
     method: "POST",
