@@ -2,7 +2,7 @@
 
 A local [Model Context Protocol](https://modelcontextprotocol.io) server for **Bitbucket Cloud**, optimized for use with [Claude Code](https://docs.claude.com/en/docs/claude-code/overview). Lets the agent read pull request diffs, read and write PR comments (including file + line inline comments), and read Bitbucket Pipelines step logs so it can debug failing builds.
 
-**Status:** local-use alpha. Not published to npm.
+**Status:** alpha. Distributed on npm as [`@bb-mcp/server`](https://www.npmjs.com/package/@bb-mcp/server).
 
 ## Tools
 
@@ -27,85 +27,56 @@ Write:
 
 All tools accept optional `workspace` and `repo`. When you run the server from inside a git checkout, those are inferred from the `origin` remote. PR-scoped tools accept an optional `pr_id`; when omitted, the server resolves it by listing open PRs whose source branch matches the current checked-out branch.
 
-## Setup (Claude Code — recommended)
+## Setup
 
-Clone the repo, open Claude Code in the checkout, and run:
+Requires Node 22+.
 
-```
-/setup
-```
-
-Claude will install dependencies, build the bundle, guide you through the one-time Bitbucket OAuth consumer creation, run the OAuth authorization flow, and register the server with the Claude Code CLI — all in a single conversation. The only things you do yourself:
-
-1. Click through the Bitbucket OAuth consumer form.
-2. Paste the generated Key and Secret back into the chat.
-3. Click "Grant access" on the Bitbucket authorization page.
-
-Requires Node 22+ and the `claude` CLI on `$PATH`.
-
-## Setup (manual fallback)
-
-If you're not in Claude Code or prefer the scripted flow:
+### Solo (you create your own OAuth consumer)
 
 ```bash
-vp install
-vp pack
-./dist/bitbucket-mcp.mjs setup           # interactive OAuth wizard
-./dist/bitbucket-mcp.mjs print-config --mcp-add-json \
-  | claude mcp add-json bitbucket --scope user -
+npx -y @bb-mcp/server setup
 ```
 
-The `setup` subcommand runs a three-step terminal wizard equivalent to what `/setup` does, minus the MCP registration at the end. `print-config --mcp-add-json` emits a JSON blob suitable for `claude mcp add-json`, or for hand-editing into another MCP host's config.
+The wizard:
 
-For non-Claude-Code MCP hosts, use the absolute path to `dist/bitbucket-mcp.mjs` directly:
+1. Opens your browser to your workspace's OAuth consumers page; you create a private consumer with the listed scopes and paste back its key + secret.
+2. Opens the browser again to authorize; you click Grant access.
+3. Detects `claude` on `PATH` and offers to register the server with Claude Code automatically (user scope).
+
+Restart Claude Code (or open a new session) and you're done.
+
+### Team (shared OAuth consumer)
+
+If your team already keeps a Bitbucket OAuth consumer in your password manager, pass the key and secret as env vars and `setup` will skip the consumer-creation step:
+
+```bash
+BITBUCKET_CLIENT_KEY=... \
+BITBUCKET_CLIENT_SECRET=... \
+npx -y @bb-mcp/server setup
+```
+
+You'll be prompted to confirm before the env vars are used.
+
+### Migrating from a previous local-build install
+
+Just run `npx -y @bb-mcp/server setup`. It detects an existing local-dist registration in `~/.claude.json`, skips OAuth (your tokens in `~/.config/bitbucket-mcp/config.json` are reused), and rewrites the registration to use npx. No re-auth needed.
+
+### Other MCP hosts (Claude Desktop, Cursor, etc.)
+
+Add this to your host's MCP config:
 
 ```json
 {
   "mcpServers": {
     "bitbucket": {
-      "command": "/absolute/path/to/bitbucket-mcp/dist/bitbucket-mcp.mjs"
+      "command": "npx",
+      "args": ["-y", "@bb-mcp/server"]
     }
   }
 }
 ```
 
-## Setup (team — shared OAuth consumer)
-
-If your team already has a Bitbucket OAuth consumer registered, you don't need to create another one. Get the **Key** and **Secret** from your team's password manager, then run these four steps:
-
-**1. Clone and build**
-
-```bash
-git clone <this-repo-url>
-cd bitbucket-mcp
-vp install
-vp pack
-```
-
-**2. Load the shared credentials** (secret piped in to avoid shell history)
-
-```bash
-echo "<SECRET>" | ./dist/bitbucket-mcp.mjs credentials --key <KEY>
-
-# Or via env var if your vault can inject it:
-BITBUCKET_CLIENT_SECRET=<SECRET> ./dist/bitbucket-mcp.mjs credentials --key <KEY>
-```
-
-**3. Authorize with your own Bitbucket account**
-
-```bash
-./dist/bitbucket-mcp.mjs authorize
-# Opens browser → click "Grant access" → tokens saved to ~/.config/bitbucket-mcp/config.json
-```
-
-**4. Register with Claude Code**
-
-```bash
-./dist/bitbucket-mcp.mjs print-config --mcp-add-json \
-  | claude mcp add-json bitbucket --scope user -
-```
-
-Everyone shares the same OAuth consumer (key + secret) but each developer authorizes independently and gets their own personal access/refresh tokens in `~/.config/bitbucket-mcp/config.json`.
+For the OAuth credentials and tokens, run `npx -y @bb-mcp/server setup` once first; they're stored in `~/.config/bitbucket-mcp/config.json` and used by every invocation regardless of host.
 
 ## Config file
 
@@ -138,6 +109,8 @@ If you're inside a git checkout of the Bitbucket repo, you typically don't need 
 
 ## Build
 
+> End users don't need to clone or build — install via `npx -y @bb-mcp/server setup`. This section is for contributors.
+
 Requires Node 22+ and [Vite+](https://viteplus.dev) (`vp`).
 
 ```bash
@@ -152,10 +125,10 @@ The build produces a single executable file at `dist/bitbucket-mcp.mjs` with a `
 ## Subcommands
 
 - `bitbucket-mcp` (no args) / `serve` — run the MCP server over stdio.
-- `setup` — interactive OAuth wizard (manual fallback).
+- `setup` — interactive wizard. Detects existing OAuth tokens and Claude Code registration to choose between fresh install, migration, or re-registration. Honors `BITBUCKET_CLIENT_KEY` + `BITBUCKET_CLIENT_SECRET` env vars for team-shared OAuth consumers (asks before using).
 - `credentials --key <KEY>` — non-interactive: read the secret from stdin (or `$BITBUCKET_CLIENT_SECRET`), persist both to the config file.
 - `authorize` — run the OAuth flow using stored credentials; open browser, wait for callback, persist tokens.
-- `print-config --mcp-add-json` / `--raw` — emit MCP registration data for piping to `claude mcp add-json` or shell substitution.
+- `print-config` — emit the JSON payload for `claude mcp add-json bitbucket --scope user`.
 - `help` — show usage.
 
 ## Security notes
