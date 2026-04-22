@@ -187,6 +187,10 @@ async function closeServer(server: http.Server): Promise<void> {
     server.close(() => {
       resolve();
     });
+    // Force-close any keep-alive connections so server.close() can complete
+    // promptly. Without this, an HTTP/1.1 keep-alive client (e.g. undici's
+    // pooled dispatcher) can hold the socket open until keepAliveTimeout.
+    server.closeAllConnections?.();
   });
 }
 
@@ -406,6 +410,7 @@ function respondSuccessPage(res: http.ServerResponse): void {
 `;
   res.statusCode = 200;
   res.setHeader("content-type", "text/html; charset=utf-8");
+  res.setHeader("connection", "close");
   res.end(html);
 }
 
@@ -443,12 +448,14 @@ function respondErrorPage(
 `;
   res.statusCode = status;
   res.setHeader("content-type", "text/html; charset=utf-8");
+  res.setHeader("connection", "close");
   res.end(html);
 }
 
 function respondNotFound(res: http.ServerResponse): void {
   res.statusCode = 404;
   res.setHeader("content-type", "text/plain; charset=utf-8");
+  res.setHeader("connection", "close");
   res.end("Not Found");
 }
 
