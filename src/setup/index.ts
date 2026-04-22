@@ -80,7 +80,7 @@ function step1Instructions(consumerUrl: string, includePickWorkspaceHint: boolea
 }
 
 const NPX_PAYLOAD_TEXT = JSON.stringify(
-  { type: "stdio", command: "npx", args: ["-y", "@bb-mcp/server"], env: {} },
+  { type: "stdio", command: "npx", args: ["-y", "@mcpkit/bitbucket"], env: {} },
   null,
   2,
 );

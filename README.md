@@ -2,7 +2,7 @@
 
 A [Model Context Protocol](https://modelcontextprotocol.io) server for **Bitbucket Cloud**, optimized for use with [Claude Code](https://docs.claude.com/en/docs/claude-code/overview). Lets the agent read pull request diffs, read and write PR comments (including file + line inline comments), and read Bitbucket Pipelines step logs so it can debug failing builds.
 
-**Status:** alpha. Distributed on npm as [`@bb-mcp/server`](https://www.npmjs.com/package/@bb-mcp/server).
+**Status:** alpha. Distributed on npm as [`@mcpkit/bitbucket`](https://www.npmjs.com/package/@mcpkit/bitbucket).
 
 ## Tools
 
@@ -34,7 +34,7 @@ Requires Node 22+.
 ### Solo (you create your own OAuth consumer)
 
 ```bash
-npx -y @bb-mcp/server setup
+npx -y @mcpkit/bitbucket setup
 ```
 
 The wizard:
@@ -52,14 +52,14 @@ If your team already keeps a Bitbucket OAuth consumer in your password manager, 
 ```bash
 BITBUCKET_CLIENT_KEY=... \
 BITBUCKET_CLIENT_SECRET=... \
-npx -y @bb-mcp/server setup
+npx -y @mcpkit/bitbucket setup
 ```
 
 You'll be prompted to confirm before the env vars are used.
 
 ### Migrating from a previous local-build install
 
-Just run `npx -y @bb-mcp/server setup`. It detects an existing local-dist registration in `~/.claude.json`, skips OAuth (your tokens in `~/.config/bitbucket-mcp/config.json` are reused), and rewrites the registration to use npx. No re-auth needed.
+Just run `npx -y @mcpkit/bitbucket setup`. It detects an existing local-dist registration in `~/.claude.json`, skips OAuth (your tokens in `~/.config/bitbucket-mcp/config.json` are reused), and rewrites the registration to use npx. No re-auth needed.
 
 ### Other MCP hosts (Claude Desktop, Cursor, etc.)
 
@@ -70,13 +70,13 @@ Add this to your host's MCP config:
   "mcpServers": {
     "bitbucket": {
       "command": "npx",
-      "args": ["-y", "@bb-mcp/server"]
+      "args": ["-y", "@mcpkit/bitbucket"]
     }
   }
 }
 ```
 
-For the OAuth credentials and tokens, run `npx -y @bb-mcp/server setup` once first; they're stored in `~/.config/bitbucket-mcp/config.json` and used by every invocation regardless of host.
+For the OAuth credentials and tokens, run `npx -y @mcpkit/bitbucket setup` once first; they're stored in `~/.config/bitbucket-mcp/config.json` and used by every invocation regardless of host.
 
 ## Config file
 
@@ -109,7 +109,7 @@ If you're inside a git checkout of the Bitbucket repo, you typically don't need 
 
 ## Build
 
-> End users don't need to clone or build — install via `npx -y @bb-mcp/server setup`. This section is for contributors.
+> End users don't need to clone or build — install via `npx -y @mcpkit/bitbucket setup`. This section is for contributors.
 
 Requires Node 22+ and [Vite+](https://viteplus.dev) (`vp`).
 
@@ -135,7 +135,7 @@ The build produces a single executable file at `dist/bitbucket-mcp.mjs` with a `
 
 - OAuth tokens and consumer secret live in a `0600` file in your home directory. No env vars, no shell history.
 - The OAuth callback listener binds only to `127.0.0.1`. The `state` parameter is a 32-byte cryptographic random and compared in constant time.
-- Tokens are refreshed transparently. If a refresh fails (e.g. the consumer was revoked), the MCP clears the tokens and asks you to re-run `npx -y @bb-mcp/server setup`.
+- Tokens are refreshed transparently. If a refresh fails (e.g. the consumer was revoked), the MCP clears the tokens and asks you to re-run `npx -y @mcpkit/bitbucket setup`.
 - This is a **Bitbucket Cloud** client — Bitbucket Server / Data Center is not supported.
 
 ## License

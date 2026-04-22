@@ -520,7 +520,7 @@ function writeClaudeConfigFor(status: "absent" | "local-build" | "on-npx" | "unk
   if (status === "local-build") {
     server = { type: "stdio", command: "/abs/dist/bitbucket-mcp.mjs", args: [] };
   } else if (status === "on-npx") {
-    server = { type: "stdio", command: "npx", args: ["-y", "@bb-mcp/server"] };
+    server = { type: "stdio", command: "npx", args: ["-y", "@mcpkit/bitbucket"] };
   } else if (status === "unknown") {
     server = { type: "stdio", command: "node", args: ["/some/other.js"] };
   }
@@ -738,7 +738,7 @@ test("auto-register: claude not on PATH prints manual JSON instead", async () =>
 
   // Should print the manual JSON payload, not call claude mcp add-json.
   expect(out.text()).toContain('"command": "npx"');
-  expect(out.text()).toContain('"@bb-mcp/server"');
+  expect(out.text()).toContain('"@mcpkit/bitbucket"');
   // Confirm we did NOT call mcp add-json.
   const argLists = (claudeRunner as unknown as { mock: { calls: [string[]][] } }).mock.calls
     .map((c) => c[0])
@@ -814,7 +814,7 @@ test("auto-register: claude found + TTY decline prints manual command", async ()
     .map((c) => c[0])
     .map((a) => a.join(" "));
   expect(argLists.some((s) => s.startsWith("mcp add-json"))).toBe(false);
-  expect(out.text()).toContain("@bb-mcp/server");
+  expect(out.text()).toContain("@mcpkit/bitbucket");
 });
 
 test("auto-register: non-TTY skips prompt, prints manual command", async () => {
@@ -850,7 +850,7 @@ test("auto-register: non-TTY skips prompt, prints manual command", async () => {
     .map((c) => c[0])
     .map((a) => a.join(" "));
   expect(argLists.some((s) => s.startsWith("mcp add-json"))).toBe(false);
-  expect(out.text()).toContain("@bb-mcp/server");
+  expect(out.text()).toContain("@mcpkit/bitbucket");
 });
 
 test("auto-register: registerBitbucketServer failing prints manual command, exits zero", async () => {
@@ -886,5 +886,5 @@ test("auto-register: registerBitbucketServer failing prints manual command, exit
   });
 
   expect(errOut.text()).toContain("duplicate name");
-  expect(out.text()).toContain("@bb-mcp/server"); // manual fallback still printed
+  expect(out.text()).toContain("@mcpkit/bitbucket"); // manual fallback still printed
 });

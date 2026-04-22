@@ -60,12 +60,12 @@ export async function readClaudeConfig(filePath: string): Promise<ClaudeConfig |
 }
 
 const BITBUCKET_KEY = "bitbucket";
-const NPX_PACKAGE = "@bb-mcp/server";
+const NPX_PACKAGE = "@mcpkit/bitbucket";
 
 /**
  * Classifies the bitbucket entry in the user's Claude Code MCP config.
  * - `absent`        — no entry, or no mcpServers, or null config
- * - `on-npx`        — already invoking us via `npx ... @bb-mcp/server`
+ * - `on-npx`        — already invoking us via `npx ... @mcpkit/bitbucket`
  * - `local-build`   — invoking an absolute path ending in `bitbucket-mcp.mjs` (the old install)
  * - `unknown-shape` — entry exists but doesn't match either expected shape
  */
