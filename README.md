@@ -1,6 +1,6 @@
 # bitbucket-mcp
 
-A local [Model Context Protocol](https://modelcontextprotocol.io) server for **Bitbucket Cloud**, optimized for use with [Claude Code](https://docs.claude.com/en/docs/claude-code/overview). Lets the agent read pull request diffs, read and write PR comments (including file + line inline comments), and read Bitbucket Pipelines step logs so it can debug failing builds.
+A [Model Context Protocol](https://modelcontextprotocol.io) server for **Bitbucket Cloud**, optimized for use with [Claude Code](https://docs.claude.com/en/docs/claude-code/overview). Lets the agent read pull request diffs, read and write PR comments (including file + line inline comments), and read Bitbucket Pipelines step logs so it can debug failing builds.
 
 **Status:** alpha. Distributed on npm as [`@bb-mcp/server`](https://www.npmjs.com/package/@bb-mcp/server).
 
@@ -135,7 +135,7 @@ The build produces a single executable file at `dist/bitbucket-mcp.mjs` with a `
 
 - OAuth tokens and consumer secret live in a `0600` file in your home directory. No env vars, no shell history.
 - The OAuth callback listener binds only to `127.0.0.1`. The `state` parameter is a 32-byte cryptographic random and compared in constant time.
-- Tokens are refreshed transparently. If a refresh fails (e.g. the consumer was revoked), the MCP clears the tokens and asks you to re-run `/setup` (or `bitbucket-mcp setup`).
+- Tokens are refreshed transparently. If a refresh fails (e.g. the consumer was revoked), the MCP clears the tokens and asks you to re-run `npx -y @bb-mcp/server setup`.
 - This is a **Bitbucket Cloud** client — Bitbucket Server / Data Center is not supported.
 
 ## License
