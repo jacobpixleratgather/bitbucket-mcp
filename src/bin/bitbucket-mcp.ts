@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import * as path from "node:path";
+import * as fs from "node:fs";
 import * as url from "node:url";
 import { runAuthorizationFlow as defaultRunAuthorizationFlow } from "../auth/index.ts";
 import { configPath, readConfig, writeConfig } from "../config/index.ts";
@@ -199,7 +199,7 @@ function isEntrypoint(): boolean {
   }
   try {
     const selfPath = url.fileURLToPath(import.meta.url);
-    return path.resolve(selfPath) === path.resolve(invokedFile);
+    return fs.realpathSync(selfPath) === fs.realpathSync(invokedFile);
   } catch {
     return false;
   }

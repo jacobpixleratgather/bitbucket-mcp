@@ -260,7 +260,10 @@ export async function runSetup(opts: SetupOptions = {}): Promise<void> {
           `(command: ${status.command}). Replace it with the npx install? [Y/n] `,
         ].join("\n"),
       );
-      const answer = stdinIsTty ? (await rl.question("")).trim().toLowerCase() : "y";
+      // Non-TTY defaults to "n" here only — we won't silently destroy an unknown
+      // registration that the user might have set up deliberately. Other branches
+      // have unambiguous intent and default to "y".
+      const answer = stdinIsTty ? (await rl.question("")).trim().toLowerCase() : "n";
       if (answer === "" || answer === "y" || answer === "yes") {
         await reregisterOnly({ stdout, stderr, claudeRunner });
       }
