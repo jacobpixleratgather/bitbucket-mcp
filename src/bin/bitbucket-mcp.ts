@@ -149,7 +149,7 @@ export async function handlePrintConfig(opts: {
   const payload = {
     type: "stdio",
     command: "npx",
-    args: ["-y", "@mcpkit/bitbucket"],
+    args: ["-y", "@mcpkits/bitbucket"],
     env: {},
   };
   opts.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);

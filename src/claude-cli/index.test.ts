@@ -81,10 +81,10 @@ test("classifyBitbucketRegistration returns 'local-build' for absolute path endi
   });
 });
 
-test("classifyBitbucketRegistration returns 'on-npx' for npx with @mcpkit/bitbucket in args", () => {
+test("classifyBitbucketRegistration returns 'on-npx' for npx with @mcpkits/bitbucket in args", () => {
   const cfg: ClaudeConfig = {
     mcpServers: {
-      bitbucket: { type: "stdio", command: "npx", args: ["-y", "@mcpkit/bitbucket"] },
+      bitbucket: { type: "stdio", command: "npx", args: ["-y", "@mcpkits/bitbucket"] },
     },
   };
   expect(classifyBitbucketRegistration(cfg)).toEqual({ kind: "on-npx" });
@@ -145,7 +145,7 @@ test("registerBitbucketServer invokes 'claude mcp add-json' with the npx payload
   expect(payload).toEqual({
     type: "stdio",
     command: "npx",
-    args: ["-y", "@mcpkit/bitbucket"],
+    args: ["-y", "@mcpkits/bitbucket"],
     env: {},
   });
   expect(args.slice(4)).toEqual(["--scope", "user"]);

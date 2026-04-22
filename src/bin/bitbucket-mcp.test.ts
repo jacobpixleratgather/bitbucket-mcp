@@ -197,7 +197,7 @@ test("authorize prints scope warning when required scopes are missing", async ()
 const NPX_PAYLOAD = {
   type: "stdio",
   command: "npx",
-  args: ["-y", "@mcpkit/bitbucket"],
+  args: ["-y", "@mcpkits/bitbucket"],
   env: {},
 };
 

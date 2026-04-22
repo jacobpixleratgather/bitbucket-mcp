@@ -8,7 +8,7 @@ This file is the source for `CLAUDE.md` and `.cursor/rules/viteplus.mdc` (both s
 
 `bitbucket-mcp` is a stdio [Model Context Protocol](https://modelcontextprotocol.io) server for **Bitbucket Cloud**. It exposes 8 tools to MCP hosts (Claude Code, Claude Desktop) for reading PR diffs, reading/writing PR comments (including inline file+line comments), and reading Bitbucket Pipelines step logs.
 
-It's distributed on npm as `@mcpkit/bitbucket`. Users run `npx -y @mcpkit/bitbucket setup` once for OAuth + Claude Code registration; the server is then loaded transparently by their MCP host on each invocation.
+It's distributed on npm as `@mcpkits/bitbucket`. Users run `npx -y @mcpkits/bitbucket setup` once for OAuth + Claude Code registration; the server is then loaded transparently by their MCP host on each invocation.
 
 The design doc is at `docs/superpowers/specs/2026-04-20-bitbucket-mcp-design.md` — read it before making architectural changes.
 
