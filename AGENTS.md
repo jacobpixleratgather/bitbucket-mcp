@@ -6,9 +6,9 @@ This file is the source for `CLAUDE.md` and `.cursor/rules/viteplus.mdc` (both s
 
 ## What this project is
 
-`bitbucket-mcp` is a local stdio [Model Context Protocol](https://modelcontextprotocol.io) server for **Bitbucket Cloud**. It exposes 8 tools to MCP hosts (Claude Code, Claude Desktop) for reading PR diffs, reading/writing PR comments (including inline file+line comments), and reading Bitbucket Pipelines step logs.
+`bitbucket-mcp` is a stdio [Model Context Protocol](https://modelcontextprotocol.io) server for **Bitbucket Cloud**. It exposes 8 tools to MCP hosts (Claude Code, Claude Desktop) for reading PR diffs, reading/writing PR comments (including inline file+line comments), and reading Bitbucket Pipelines step logs.
 
-It is a local-use tool, not published to npm. Users build it with `vp pack`, run `./dist/bitbucket-mcp.mjs setup` once for OAuth, and point their MCP host at the absolute path of the built file.
+It's distributed on npm as `@bb-mcp/server`. Users run `npx -y @bb-mcp/server setup` once for OAuth + Claude Code registration; the server is then loaded transparently by their MCP host on each invocation.
 
 The design doc is at `docs/superpowers/specs/2026-04-20-bitbucket-mcp-design.md` — read it before making architectural changes.
 
@@ -40,6 +40,20 @@ This repo uses [Vite+](https://viteplus.dev). The global `vp` CLI wraps Vite, Ro
 
 `vp <command>` always runs Vite+'s builtin for that command. To run a `package.json` script that shares a name with a builtin, use `vp run <script>`.
 
+## Release
+
+The package is published manually from a developer machine. Three commands:
+
+```bash
+pnpm exec bumpp        # interactive: pick patch/minor/major; commits + tags
+git push --follow-tags # if bumpp didn't push for you
+vp pm publish          # runs prepublishOnly (check + test + build) then uploads
+```
+
+`prepublishOnly` runs `vp check && vp test && vp run build` so a broken build never reaches the registry. 2FA is required on the npm account; the publish prompts for an OTP.
+
+We do not maintain a `CHANGELOG.md` — use GitHub Releases (auto-generated from PR titles) for the changelog. We do not currently sign npm provenance (would require GitHub Actions OIDC).
+
 ## Source layout
 
 ```
@@ -49,6 +63,9 @@ src/
 ├── config/               # Read/write ~/.config/bitbucket-mcp/config.json,
 │                         # mode 0600. Pure filesystem; no auth/http knowledge.
 ├── git/                  # Parse `origin` remote → { workspace, repo }.
+├── claude-cli/           # Read ~/.claude.json + spawn `claude mcp add-json`
+│                         # to register/remove the bitbucket server. Pure I/O;
+│                         # no auth/http/git dependencies.
 ├── bitbucket/            # Typed Bitbucket Cloud REST client.
 │                         # Takes a token provider callback — no direct auth dep.
 ├── auth/                 # OAuth 2.0 flow + token refresh. Uses config/.
@@ -62,7 +79,7 @@ src/
 └── bin/                  # Dispatcher: `(default)|serve|setup|help`.
 ```
 
-Module dependency rule: `config → auth → bitbucket → server → bin`; `git` is a leaf; `setup` depends on `config` + `auth`. No cycles. Tests import only from `../types.ts` + the module under test.
+Module dependency rule: `config → auth → bitbucket → server → bin`; `git` and `claude-cli` are leaves; `setup` depends on `config` + `auth` + `claude-cli`. No cycles. Tests import only from `../types.ts` + the module under test.
 
 ## Testing conventions
 
@@ -88,7 +105,6 @@ Module dependency rule: `config → auth → bitbucket → server → bin`; `git
 - PR-lifecycle writes: `create_pr`, `merge_pr`, `decline_pr`, `set_pr_approval`, `set_pr_draft_state`.
 - `retry_pr_pipeline`.
 - MCPB packaging for non-developer install.
-- npm publishing.
 - Hosted OAuth broker (design doc covers why it was deliberately avoided).
 
 ## Security-sensitive areas — touch carefully
