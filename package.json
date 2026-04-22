@@ -19,7 +19,7 @@
     "url": "git+https://github.com/jacobpixleratgather/bitbucket-mcp.git"
   },
   "bin": {
-    "server": "./dist/bitbucket-mcp.mjs"
+    "bitbucket-mcp": "./dist/bitbucket-mcp.mjs"
   },
   "files": [
     "dist",
