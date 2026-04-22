@@ -194,44 +194,30 @@ test("authorize prints scope warning when required scopes are missing", async ()
 // print-config
 // --------------------------------------------------------------------------
 
-test("print-config --raw emits just the bin path", async () => {
+const NPX_PAYLOAD = {
+  type: "stdio",
+  command: "npx",
+  args: ["-y", "@bb-mcp/server"],
+  env: {},
+};
+
+test("print-config (bare) emits the hardcoded npx payload", async () => {
   const stdout = new PassThrough();
   const out = collect(stdout);
-  await handlePrintConfig({
-    argv: ["--raw"],
-    binPath: "/abs/path/to/dist/bitbucket-mcp.mjs",
-    stdout,
-  });
-  expect(out.text().trim()).toBe("/abs/path/to/dist/bitbucket-mcp.mjs");
+  await handlePrintConfig({ argv: [], stdout });
+  expect(JSON.parse(out.text())).toEqual(NPX_PAYLOAD);
 });
 
-test("print-config --mcp-add-json emits valid JSON with absolute command", async () => {
+test("print-config --mcp-add-json also emits the npx payload", async () => {
   const stdout = new PassThrough();
   const out = collect(stdout);
-  await handlePrintConfig({
-    argv: ["--mcp-add-json"],
-    binPath: "/abs/path/to/dist/bitbucket-mcp.mjs",
-    stdout,
-  });
-  const parsed = JSON.parse(out.text()) as {
-    type: string;
-    command: string;
-    args: unknown[];
-    env: Record<string, unknown>;
-  };
-  expect(parsed.type).toBe("stdio");
-  expect(parsed.command).toBe("/abs/path/to/dist/bitbucket-mcp.mjs");
-  expect(Array.isArray(parsed.args)).toBe(true);
-  expect(parsed.args).toHaveLength(0);
+  await handlePrintConfig({ argv: ["--mcp-add-json"], stdout });
+  expect(JSON.parse(out.text())).toEqual(NPX_PAYLOAD);
 });
 
-test("print-config throws when neither --raw nor --mcp-add-json is given", async () => {
+test("print-config --raw is rejected with a clear error", async () => {
   const stdout = new PassThrough();
-  await expect(
-    handlePrintConfig({
-      argv: [],
-      binPath: "/x",
-      stdout,
-    }),
-  ).rejects.toThrow(/requires one of/);
+  await expect(handlePrintConfig({ argv: ["--raw"], stdout })).rejects.toThrow(
+    /is no longer supported/,
+  );
 });

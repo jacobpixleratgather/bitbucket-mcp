@@ -38,7 +38,6 @@ async function main(argv: readonly string[]): Promise<void> {
     case "print-config":
       await handlePrintConfig({
         argv: rest,
-        binPath: binPath ?? "/absolute/path/to/dist/bitbucket-mcp.mjs",
         stdout: process.stdout,
       });
       return;
@@ -72,12 +71,9 @@ function printUsage(out: NodeJS.WritableStream): void {
       "                  secret from stdin (or $BITBUCKET_CLIENT_SECRET). Non-interactive.",
       "  authorize       Run the OAuth authorization flow using stored credentials.",
       "                  Opens the browser, waits for callback, persists tokens.",
-      "  print-config    Print MCP registration data.",
-      "                    --mcp-add-json  JSON suitable for `claude mcp add-json`",
-      "                    --raw           Absolute bin path on one line",
+      "  print-config    Print the JSON payload for `claude mcp add-json bitbucket`",
+      "                  (also accepts the legacy --mcp-add-json flag).",
       "  help            Show this message",
-      "",
-      "Claude Code users: run /setup from inside this repo to automate the full flow.",
       "",
     ].join("\n"),
   );
@@ -147,25 +143,19 @@ export async function handleAuthorize(opts: {
 
 export async function handlePrintConfig(opts: {
   argv: readonly string[];
-  binPath: string;
   stdout: NodeJS.WritableStream;
 }): Promise<void> {
-  const mode = opts.argv.includes("--raw")
-    ? "raw"
-    : opts.argv.includes("--mcp-add-json")
-      ? "mcp-add-json"
-      : null;
-  if (mode === null) {
-    throw new Error("`print-config` requires one of --mcp-add-json or --raw");
+  if (opts.argv.includes("--raw")) {
+    throw new Error(
+      "`print-config --raw` is no longer supported. The package is now distributed via npm; " +
+        "use `print-config` (or `--mcp-add-json`) to get the JSON payload for `claude mcp add-json`.",
+    );
   }
-  if (mode === "raw") {
-    opts.stdout.write(`${opts.binPath}\n`);
-    return;
-  }
+  // Both bare `print-config` and `--mcp-add-json` emit the same payload.
   const payload = {
     type: "stdio",
-    command: opts.binPath,
-    args: [],
+    command: "npx",
+    args: ["-y", "@bb-mcp/server"],
     env: {},
   };
   opts.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
