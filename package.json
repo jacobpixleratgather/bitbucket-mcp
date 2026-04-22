@@ -1,5 +1,5 @@
 {
-  "name": "bitbucket-mcp",
+  "name": "@bb-mcp/server",
   "version": "0.1.0",
   "description": "A local stdio MCP server for Bitbucket Cloud",
   "keywords": [
@@ -9,12 +9,22 @@
     "mcp",
     "model-context-protocol"
   ],
+  "homepage": "https://github.com/jacobpixleratgather/bitbucket-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/jacobpixleratgather/bitbucket-mcp/issues"
+  },
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jacobpixleratgather/bitbucket-mcp.git"
+  },
   "bin": {
-    "bitbucket-mcp": "./dist/bitbucket-mcp.mjs"
+    "server": "./dist/bitbucket-mcp.mjs"
   },
   "files": [
-    "dist"
+    "dist",
+    "README.md",
+    "LICENSE"
   ],
   "type": "module",
   "exports": {
@@ -29,9 +39,8 @@
     "dev": "vp pack --watch",
     "test": "vp test",
     "check": "vp check",
-    "prepublishOnly": "vp run build",
-    "prepare": "vp config",
-    "mcp:setup": "node -e \"console.log('Open Claude Code in this directory and run /setup.\\n(Or, without Claude Code: ./dist/bitbucket-mcp.mjs setup)')\""
+    "prepublishOnly": "vp check && vp test && vp run build",
+    "prepare": "vp config"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
@@ -44,6 +53,9 @@
     "bumpp": "^11.0.1",
     "typescript": "^6.0.2",
     "vite-plus": "^0.1.14"
+  },
+  "engines": {
+    "node": ">=22"
   },
   "packageManager": "pnpm@10.33.0"
 }
