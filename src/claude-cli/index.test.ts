@@ -1,8 +1,14 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { afterEach, beforeEach, expect, test } from "vite-plus/test";
+import { afterEach, beforeEach, expect, test, vi } from "vite-plus/test";
 import { classifyBitbucketRegistration, readClaudeConfig, type ClaudeConfig } from "./index.ts";
+import {
+  type ClaudeRunner,
+  findClaudeBinary,
+  registerBitbucketServer,
+  removeBitbucketServer,
+} from "./index.ts";
 
 let tmpDir: string;
 
@@ -94,4 +100,81 @@ test("classifyBitbucketRegistration returns 'unknown-shape' for anything else", 
     kind: "unknown-shape",
     command: "node",
   });
+});
+
+// --------- findClaudeBinary ---------
+
+test("findClaudeBinary returns true when 'claude --version' exits 0", async () => {
+  const runner: ClaudeRunner = vi.fn(async () => ({ exitCode: 0, stdout: "1.0.0\n", stderr: "" }));
+  const result = await findClaudeBinary({ run: runner });
+  expect(result).toBe(true);
+  expect(runner).toHaveBeenCalledWith(["--version"]);
+});
+
+test("findClaudeBinary returns false when binary cannot be spawned", async () => {
+  const runner: ClaudeRunner = vi.fn(async () => {
+    const err = new Error("spawn claude ENOENT") as NodeJS.ErrnoException;
+    err.code = "ENOENT";
+    throw err;
+  });
+  const result = await findClaudeBinary({ run: runner });
+  expect(result).toBe(false);
+});
+
+test("findClaudeBinary returns false when 'claude --version' exits non-zero", async () => {
+  const runner: ClaudeRunner = vi.fn(async () => ({ exitCode: 127, stdout: "", stderr: "" }));
+  expect(await findClaudeBinary({ run: runner })).toBe(false);
+});
+
+// --------- registerBitbucketServer ---------
+
+test("registerBitbucketServer invokes 'claude mcp add-json' with the npx payload", async () => {
+  const calls: string[][] = [];
+  const runner: ClaudeRunner = vi.fn(async (args) => {
+    calls.push([...args]);
+    return { exitCode: 0, stdout: "", stderr: "" };
+  });
+  await registerBitbucketServer({ run: runner });
+  expect(calls).toHaveLength(1);
+  const args = calls[0]!;
+  expect(args[0]).toBe("mcp");
+  expect(args[1]).toBe("add-json");
+  expect(args[2]).toBe("bitbucket");
+  // 4th arg is the JSON payload string
+  const payload = JSON.parse(args[3]!) as Record<string, unknown>;
+  expect(payload).toEqual({
+    type: "stdio",
+    command: "npx",
+    args: ["-y", "@bb-mcp/server"],
+    env: {},
+  });
+  expect(args.slice(4)).toEqual(["--scope", "user"]);
+});
+
+test("registerBitbucketServer throws with stderr when claude exits non-zero", async () => {
+  const runner: ClaudeRunner = vi.fn(async () => ({
+    exitCode: 1,
+    stdout: "",
+    stderr: "duplicate name\n",
+  }));
+  await expect(registerBitbucketServer({ run: runner })).rejects.toThrow(/duplicate name/);
+});
+
+// --------- removeBitbucketServer ---------
+
+test("removeBitbucketServer invokes 'claude mcp remove' for user scope", async () => {
+  const runner: ClaudeRunner = vi.fn(async () => ({ exitCode: 0, stdout: "", stderr: "" }));
+  await removeBitbucketServer({ run: runner });
+  expect(runner).toHaveBeenCalledWith(["mcp", "remove", "bitbucket", "--scope", "user"]);
+});
+
+test("removeBitbucketServer is a no-op when claude returns 'not found' (exit 1)", async () => {
+  // claude mcp remove exits non-zero if the entry isn't there. We treat that as
+  // success so callers can call remove-then-add unconditionally.
+  const runner: ClaudeRunner = vi.fn(async () => ({
+    exitCode: 1,
+    stdout: "",
+    stderr: "MCP server 'bitbucket' not found\n",
+  }));
+  await expect(removeBitbucketServer({ run: runner })).resolves.toBeUndefined();
 });

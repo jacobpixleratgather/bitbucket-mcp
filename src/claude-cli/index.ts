@@ -90,3 +90,86 @@ export function classifyBitbucketRegistration(cfg: ClaudeConfig | null): Registr
 function isNodeError(err: unknown): err is NodeJS.ErrnoException {
   return err instanceof Error && "code" in err;
 }
+
+import { spawn } from "node:child_process";
+
+/**
+ * Abstraction over `spawn('claude', args)`. Tests inject a fake; the real
+ * runner uses node:child_process. All callers go through this so behavior is
+ * easy to verify without actually launching processes.
+ */
+export type ClaudeRunner = (args: readonly string[]) => Promise<ClaudeResult>;
+
+export type ClaudeResult = {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+};
+
+/** Spawns `claude` with the given args and collects its output. */
+export const defaultClaudeRunner: ClaudeRunner = async (args) => {
+  return await new Promise<ClaudeResult>((resolve, reject) => {
+    const child = spawn("claude", [...args], { shell: false });
+    const out: Buffer[] = [];
+    const err: Buffer[] = [];
+    child.stdout.on("data", (chunk: Buffer) => out.push(chunk));
+    child.stderr.on("data", (chunk: Buffer) => err.push(chunk));
+    child.on("error", reject);
+    child.on("close", (code) => {
+      resolve({
+        exitCode: code ?? 0,
+        stdout: Buffer.concat(out).toString("utf8"),
+        stderr: Buffer.concat(err).toString("utf8"),
+      });
+    });
+  });
+};
+
+/**
+ * Returns true if `claude --version` exits 0. Returns false on ENOENT (binary
+ * not on PATH) or any non-zero exit. Never throws.
+ */
+export async function findClaudeBinary(opts: { run: ClaudeRunner }): Promise<boolean> {
+  try {
+    const result = await opts.run(["--version"]);
+    return result.exitCode === 0;
+  } catch (err) {
+    if (isNodeError(err) && err.code === "ENOENT") {
+      return false;
+    }
+    return false;
+  }
+}
+
+/**
+ * Runs `claude mcp add-json bitbucket <payload> --scope user` with the
+ * hardcoded npx invocation payload. Throws (with stderr in the message) if
+ * claude exits non-zero — caller is responsible for printing the manual
+ * fallback command.
+ */
+export async function registerBitbucketServer(opts: { run: ClaudeRunner }): Promise<void> {
+  const payload = JSON.stringify({
+    type: "stdio",
+    command: "npx",
+    args: ["-y", "@bb-mcp/server"],
+    env: {},
+  });
+  const result = await opts.run(["mcp", "add-json", "bitbucket", payload, "--scope", "user"]);
+  if (result.exitCode !== 0) {
+    throw new Error(
+      `claude mcp add-json failed (exit ${result.exitCode}): ${result.stderr.trim()}`,
+    );
+  }
+}
+
+/**
+ * Runs `claude mcp remove bitbucket --scope user`. Treats "not found" as
+ * success so callers can call remove-then-add unconditionally during a
+ * migration. Other non-zero exits throw.
+ */
+export async function removeBitbucketServer(opts: { run: ClaudeRunner }): Promise<void> {
+  const result = await opts.run(["mcp", "remove", "bitbucket", "--scope", "user"]);
+  if (result.exitCode === 0) return;
+  if (/not found/i.test(result.stderr)) return;
+  throw new Error(`claude mcp remove failed (exit ${result.exitCode}): ${result.stderr.trim()}`);
+}
