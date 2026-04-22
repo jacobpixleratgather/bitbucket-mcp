@@ -1,5 +1,4 @@
 import * as fs from "node:fs";
-import * as nodePath from "node:path";
 import * as readline from "node:readline/promises";
 import open from "open";
 import {
@@ -10,6 +9,7 @@ import {
   classifyBitbucketRegistration,
   defaultClaudeJsonPath,
   defaultClaudeRunner,
+  findClaudeBinary,
   registerBitbucketServer,
   removeBitbucketServer,
   type ClaudeConfig,
@@ -28,7 +28,6 @@ export type SetupOptions = {
   runAuthorizationFlow?: typeof defaultRunAuthorizationFlow;
   openBrowser?: (url: string) => Promise<unknown>;
   inferRepo?: () => Promise<RepoTarget | null>;
-  binPath?: string;
   claudeJsonPath?: string;
   claudeRunner?: ClaudeRunner;
 };
@@ -80,11 +79,24 @@ function step1Instructions(consumerUrl: string, includePickWorkspaceHint: boolea
   ].join("\n");
 }
 
-function printAuthSuccess(p: {
-  stdout: NodeJS.WritableStream;
-  tokens: StoredTokens;
-  binPath: string;
-}): void {
+const NPX_PAYLOAD_TEXT = JSON.stringify(
+  { type: "stdio", command: "npx", args: ["-y", "@bb-mcp/server"], env: {} },
+  null,
+  2,
+);
+
+function printManualRegistration(stdout: NodeJS.WritableStream): void {
+  stdout.write(
+    [
+      "",
+      "Add this to your MCP host config (e.g. via `claude mcp add-json bitbucket --scope user`):",
+      NPX_PAYLOAD_TEXT,
+      "",
+    ].join("\n"),
+  );
+}
+
+function printAuthSuccess(p: { stdout: NodeJS.WritableStream; tokens: StoredTokens }): void {
   const grantedSet = new Set(p.tokens.scopes);
   const missing = REQUIRED_SCOPES.filter((s) => !grantedSet.has(s));
   const scopesText = p.tokens.scopes.length > 0 ? p.tokens.scopes.join(", ") : "(none reported)";
@@ -102,7 +114,6 @@ function printAuthSuccess(p: {
       ].join("\n"),
     );
   }
-  p.stdout.write(`\nNext: add this to your MCP host config:\n  { "command": "${p.binPath}" }\n`);
 }
 
 /**
@@ -118,11 +129,6 @@ export async function runSetup(opts: SetupOptions = {}): Promise<void> {
   const runAuthorizationFlow = opts.runAuthorizationFlow ?? defaultRunAuthorizationFlow;
   const openBrowser = opts.openBrowser ?? ((url: string) => open(url));
   const inferRepo = opts.inferRepo ?? (() => defaultInferBitbucketRepo());
-  const binPath =
-    opts.binPath ??
-    (process.argv[1] !== undefined && process.argv[1].length > 0
-      ? nodePath.resolve(process.argv[1])
-      : "/absolute/path/to/dist/bitbucket-mcp.mjs");
 
   const env = opts.env ?? process.env;
   const claudeJsonPath = opts.claudeJsonPath ?? defaultClaudeJsonPath();
@@ -171,6 +177,11 @@ export async function runSetup(opts: SetupOptions = {}): Promise<void> {
       }
 
       if (envCredsAccepted) {
+        // Close the wizard's readline before any async I/O so that if the test
+        // harness feeds a line via setImmediate, it lands in stdin's buffer
+        // (stdin is paused when rl is closed) rather than being silently
+        // consumed by readline with no pending question.
+        rl.close();
         await writeConfig({ clientKey: envKey!, clientSecret: envSecret! });
         stdout.write(
           [
@@ -185,7 +196,8 @@ export async function runSetup(opts: SetupOptions = {}): Promise<void> {
           clientKey: envKey!,
           clientSecret: envSecret!,
         });
-        printAuthSuccess({ stdout, tokens, binPath });
+        printAuthSuccess({ stdout, tokens });
+        await attemptAutoRegister({ stdin, stdout, stderr, claudeRunner });
         return; // skip the full 3-step wizard entirely
       }
     }
@@ -293,6 +305,12 @@ export async function runSetup(opts: SetupOptions = {}): Promise<void> {
       prompt: "Secret: ",
     });
 
+    // Close the wizard's readline before any async I/O so that test-harness
+    // input fed via setImmediate lands in stdin's buffer (stdin is paused when
+    // rl is closed) rather than being silently consumed with no pending
+    // question. attemptAutoRegister creates its own fresh readline.
+    rl.close();
+
     await writeConfig({ clientKey, clientSecret });
 
     // ------ Step 3 ------
@@ -306,7 +324,8 @@ export async function runSetup(opts: SetupOptions = {}): Promise<void> {
       ].join("\n"),
     );
     const tokens = await runAuthorizationFlow({ clientKey, clientSecret });
-    printAuthSuccess({ stdout, tokens, binPath });
+    printAuthSuccess({ stdout, tokens });
+    await attemptAutoRegister({ stdin, stdout, stderr, claudeRunner });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     stderr.write(`\nSetup failed: ${msg}\n`);
@@ -359,6 +378,57 @@ function readClaudeConfigSync(filePath: string): ClaudeConfig | null {
 }
 
 /**
+ * Detect claude on PATH, prompt the user (if TTY), then run
+ * `claude mcp add-json` for the bitbucket server. Falls back to printing the
+ * manual JSON payload on every failure mode (claude not found, user declines,
+ * non-TTY, claude exits non-zero). Never throws — the caller's OAuth tokens
+ * are already on disk; we don't want a registration hiccup to abort.
+ *
+ * IMPORTANT: The caller must close its own readline interface BEFORE calling
+ * this function. This function creates a fresh readline interface so that any
+ * stdin data written by the test harness during the preceding async I/O (e.g.
+ * writeConfig) lands in the PassThrough buffer rather than being consumed by
+ * the caller's readline — those bytes are then picked up by our fresh reader.
+ */
+async function attemptAutoRegister(p: {
+  stdin: NodeJS.ReadableStream;
+  stdout: NodeJS.WritableStream;
+  stderr: NodeJS.WritableStream;
+  claudeRunner: ClaudeRunner;
+}): Promise<void> {
+  const present = await findClaudeBinary({ run: p.claudeRunner });
+  if (!present) {
+    printManualRegistration(p.stdout);
+    return;
+  }
+  const stdinIsTty = (p.stdin as { isTTY?: boolean }).isTTY === true;
+  if (!stdinIsTty) {
+    printManualRegistration(p.stdout);
+    return;
+  }
+  p.stdout.write(`\nRegister with Claude Code as 'bitbucket' MCP server (user scope)? [Y/n] `);
+  const rl = readline.createInterface({ input: p.stdin, output: p.stdout, terminal: false });
+  let answer: string;
+  try {
+    answer = (await rl.question("")).trim().toLowerCase();
+  } finally {
+    rl.close();
+  }
+  if (!(answer === "" || answer === "y" || answer === "yes")) {
+    printManualRegistration(p.stdout);
+    return;
+  }
+  try {
+    await registerBitbucketServer({ run: p.claudeRunner });
+    p.stdout.write("\n✅ Registered bitbucket MCP server with Claude Code.\n");
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    p.stderr.write(`\nFailed to register: ${msg}\n`);
+    printManualRegistration(p.stdout);
+  }
+}
+
+/**
  * Removes any existing 'bitbucket' MCP server registration and registers the
  * npx-based one. Used for the migrate / register-only / unknown-shape flows.
  *
@@ -375,6 +445,11 @@ async function reregisterOnly(p: {
   stderr: NodeJS.WritableStream;
   claudeRunner: ClaudeRunner;
 }): Promise<void> {
+  const present = await findClaudeBinary({ run: p.claudeRunner });
+  if (!present) {
+    printManualRegistration(p.stdout);
+    return;
+  }
   try {
     await removeBitbucketServer({ run: p.claudeRunner });
     await registerBitbucketServer({ run: p.claudeRunner });
@@ -382,9 +457,7 @@ async function reregisterOnly(p: {
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     p.stderr.write(`\nFailed to register: ${msg}\n`);
-    p.stdout.write(
-      `\nManual command:\n  claude mcp add-json bitbucket --scope user '<json from \`@bb-mcp/server print-config\`>'\n`,
-    );
+    printManualRegistration(p.stdout);
   }
 }
 

@@ -86,11 +86,10 @@ test("promptMaskedInput reads input without echoing on non-TTY", async () => {
 
 // ---------- Injection points ----------
 
-test("runSetup uses injected openBrowser, inferRepo, and binPath", async () => {
+test("runSetup uses injected openBrowser and inferRepo", async () => {
   const stdin = new PassThrough();
   const stdout = new PassThrough();
   const stderr = new PassThrough();
-  const out = collect(stdout);
 
   script(stdin, ["", "k", "s"]);
 
@@ -109,14 +108,12 @@ test("runSetup uses injected openBrowser, inferRepo, and binPath", async () => {
     stderr,
     openBrowser,
     inferRepo,
-    binPath: "/custom/path/bitbucket-mcp.mjs",
     claudeJsonPath: "/nonexistent",
     runAuthorizationFlow:
       runAuthorizationFlow as unknown as typeof import("../auth/index.ts").runAuthorizationFlow,
   });
 
   expect(inferRepo).toHaveBeenCalled();
-  expect(out.text()).toContain("/custom/path/bitbucket-mcp.mjs");
 });
 
 // ---------- Scope verification ----------
@@ -380,6 +377,7 @@ test("env-var fast-path: TTY accept skips Steps 1+2 and authorizes with env cred
       BITBUCKET_CLIENT_SECRET: "env-secret",
     },
     claudeJsonPath: "/nonexistent",
+    claudeRunner: vi.fn(async () => ({ exitCode: 1, stdout: "", stderr: "" })) as ClaudeRunner,
     openBrowser: vi.fn(async () => undefined),
     inferRepo: vi.fn(async () => null),
     runAuthorizationFlow:
@@ -414,6 +412,7 @@ test("env-var fast-path: TTY decline runs the full wizard, ignoring env vars", a
       BITBUCKET_CLIENT_SECRET: "env-secret",
     },
     claudeJsonPath: "/nonexistent",
+    claudeRunner: vi.fn(async () => ({ exitCode: 1, stdout: "", stderr: "" })) as ClaudeRunner,
     openBrowser: vi.fn(async () => undefined),
     inferRepo: vi.fn(async () => null),
     runAuthorizationFlow:
@@ -701,4 +700,191 @@ test("matrix: unknown shape → warn and replace with confirmation", async () =>
   });
 
   expect(out.text()).toContain("doesn't match a known shape");
+});
+
+// ---------- Auto-register at exit ----------
+
+test("auto-register: claude not on PATH prints manual JSON instead", async () => {
+  const stdin = new PassThrough();
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  const out = collect(stdout);
+
+  script(stdin, ["", "k", "s"]);
+
+  // Simulate claude not on PATH: --version throws ENOENT.
+  const claudeRunner: ClaudeRunner = vi.fn(async (args) => {
+    if (args.includes("--version")) {
+      const err = new Error("spawn claude ENOENT") as NodeJS.ErrnoException;
+      err.code = "ENOENT";
+      throw err;
+    }
+    return { exitCode: 0, stdout: "", stderr: "" };
+  });
+
+  await runSetup({
+    stdin,
+    stdout,
+    stderr,
+    env: {},
+    claudeJsonPath: "/nonexistent",
+    claudeRunner,
+    openBrowser: vi.fn(async () => undefined),
+    inferRepo: vi.fn(async () => null),
+    runAuthorizationFlow: vi.fn(async () =>
+      sampleTokens(),
+    ) as unknown as typeof import("../auth/index.ts").runAuthorizationFlow,
+  });
+
+  // Should print the manual JSON payload, not call claude mcp add-json.
+  expect(out.text()).toContain('"command": "npx"');
+  expect(out.text()).toContain('"@bb-mcp/server"');
+  // Confirm we did NOT call mcp add-json.
+  const argLists = (claudeRunner as unknown as { mock: { calls: [string[]][] } }).mock.calls
+    .map((c) => c[0])
+    .map((a) => a.join(" "));
+  expect(argLists.some((s) => s.startsWith("mcp add-json"))).toBe(false);
+});
+
+test("auto-register: claude found + TTY accept calls registerBitbucketServer", async () => {
+  const stdin = new PassThrough() as PassThrough & { isTTY?: boolean };
+  stdin.isTTY = true;
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+
+  // Wizard prompts: Step 1 enter (""), key, secret, then auto-register prompt ("").
+  script(stdin, ["", "k", "s", ""]);
+
+  const claudeRunner: ClaudeRunner = vi.fn(async () => ({
+    exitCode: 0,
+    stdout: "",
+    stderr: "",
+  }));
+
+  await runSetup({
+    stdin,
+    stdout,
+    stderr,
+    env: {},
+    claudeJsonPath: "/nonexistent",
+    claudeRunner,
+    openBrowser: vi.fn(async () => undefined),
+    inferRepo: vi.fn(async () => null),
+    runAuthorizationFlow: vi.fn(async () =>
+      sampleTokens(),
+    ) as unknown as typeof import("../auth/index.ts").runAuthorizationFlow,
+  });
+
+  const argLists = (claudeRunner as unknown as { mock: { calls: [string[]][] } }).mock.calls
+    .map((c) => c[0])
+    .map((a) => a.join(" "));
+  expect(argLists.some((s) => s.startsWith("mcp add-json bitbucket"))).toBe(true);
+});
+
+test("auto-register: claude found + TTY decline prints manual command", async () => {
+  const stdin = new PassThrough() as PassThrough & { isTTY?: boolean };
+  stdin.isTTY = true;
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  const out = collect(stdout);
+
+  script(stdin, ["", "k", "s", "n"]);
+
+  const claudeRunner: ClaudeRunner = vi.fn(async () => ({
+    exitCode: 0,
+    stdout: "",
+    stderr: "",
+  }));
+
+  await runSetup({
+    stdin,
+    stdout,
+    stderr,
+    env: {},
+    claudeJsonPath: "/nonexistent",
+    claudeRunner,
+    openBrowser: vi.fn(async () => undefined),
+    inferRepo: vi.fn(async () => null),
+    runAuthorizationFlow: vi.fn(async () =>
+      sampleTokens(),
+    ) as unknown as typeof import("../auth/index.ts").runAuthorizationFlow,
+  });
+
+  const argLists = (claudeRunner as unknown as { mock: { calls: [string[]][] } }).mock.calls
+    .map((c) => c[0])
+    .map((a) => a.join(" "));
+  expect(argLists.some((s) => s.startsWith("mcp add-json"))).toBe(false);
+  expect(out.text()).toContain("@bb-mcp/server");
+});
+
+test("auto-register: non-TTY skips prompt, prints manual command", async () => {
+  const stdin = new PassThrough();
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  const out = collect(stdout);
+
+  // Non-TTY (no isTTY override) — wizard sees TTY=false.
+  script(stdin, ["", "k", "s"]);
+
+  const claudeRunner: ClaudeRunner = vi.fn(async () => ({
+    exitCode: 0,
+    stdout: "",
+    stderr: "",
+  }));
+
+  await runSetup({
+    stdin,
+    stdout,
+    stderr,
+    env: {},
+    claudeJsonPath: "/nonexistent",
+    claudeRunner,
+    openBrowser: vi.fn(async () => undefined),
+    inferRepo: vi.fn(async () => null),
+    runAuthorizationFlow: vi.fn(async () =>
+      sampleTokens(),
+    ) as unknown as typeof import("../auth/index.ts").runAuthorizationFlow,
+  });
+
+  const argLists = (claudeRunner as unknown as { mock: { calls: [string[]][] } }).mock.calls
+    .map((c) => c[0])
+    .map((a) => a.join(" "));
+  expect(argLists.some((s) => s.startsWith("mcp add-json"))).toBe(false);
+  expect(out.text()).toContain("@bb-mcp/server");
+});
+
+test("auto-register: registerBitbucketServer failing prints manual command, exits zero", async () => {
+  const stdin = new PassThrough() as PassThrough & { isTTY?: boolean };
+  stdin.isTTY = true;
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  const out = collect(stdout);
+  const errOut = collect(stderr);
+
+  script(stdin, ["", "k", "s", ""]);
+
+  const claudeRunner: ClaudeRunner = vi.fn(async (args) => {
+    if (args.includes("--version")) return { exitCode: 0, stdout: "1\n", stderr: "" };
+    if (args.includes("add-json")) {
+      return { exitCode: 1, stdout: "", stderr: "duplicate name 'bitbucket'" };
+    }
+    return { exitCode: 0, stdout: "", stderr: "" };
+  });
+
+  await runSetup({
+    stdin,
+    stdout,
+    stderr,
+    env: {},
+    claudeJsonPath: "/nonexistent",
+    claudeRunner,
+    openBrowser: vi.fn(async () => undefined),
+    inferRepo: vi.fn(async () => null),
+    runAuthorizationFlow: vi.fn(async () =>
+      sampleTokens(),
+    ) as unknown as typeof import("../auth/index.ts").runAuthorizationFlow,
+  });
+
+  expect(errOut.text()).toContain("duplicate name");
+  expect(out.text()).toContain("@bb-mcp/server"); // manual fallback still printed
 });

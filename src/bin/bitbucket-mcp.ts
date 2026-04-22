@@ -16,14 +16,13 @@ const REQUIRED_SCOPES: readonly string[] = [
 
 async function main(argv: readonly string[]): Promise<void> {
   const [, , subcommand, ...rest] = argv;
-  const binPath = resolveBinPath(argv);
   switch (subcommand) {
     case undefined:
     case "serve":
       await runServer();
       return;
     case "setup":
-      await runSetup({ binPath });
+      await runSetup();
       return;
     case "credentials":
       await handleCredentials({
@@ -51,11 +50,6 @@ async function main(argv: readonly string[]): Promise<void> {
       printUsage(process.stderr);
       process.exit(2);
   }
-}
-
-function resolveBinPath(argv: readonly string[]): string | undefined {
-  const argv1 = argv[1];
-  return argv1 !== undefined && argv1.length > 0 ? path.resolve(argv1) : undefined;
 }
 
 function printUsage(out: NodeJS.WritableStream): void {
