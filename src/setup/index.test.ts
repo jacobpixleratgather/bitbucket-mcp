@@ -5,6 +5,7 @@ import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, expect, test, vi } from "vite-plus/test";
 import type { RepoTarget, StoredTokens } from "../types.ts";
 import { promptMaskedInput, runSetup } from "./index.ts";
+import { type ClaudeRunner } from "../claude-cli/index.ts";
 
 let tmpDir: string;
 let originalXdg: string | undefined;
@@ -109,6 +110,7 @@ test("runSetup uses injected openBrowser, inferRepo, and binPath", async () => {
     openBrowser,
     inferRepo,
     binPath: "/custom/path/bitbucket-mcp.mjs",
+    claudeJsonPath: "/nonexistent",
     runAuthorizationFlow:
       runAuthorizationFlow as unknown as typeof import("../auth/index.ts").runAuthorizationFlow,
   });
@@ -146,6 +148,7 @@ test("scope warning is printed when a required scope is missing", async () => {
     stdin,
     stdout,
     stderr,
+    claudeJsonPath: "/nonexistent",
     openBrowser: vi.fn(async () => undefined),
     inferRepo: vi.fn(async () => null),
     runAuthorizationFlow:
@@ -176,6 +179,7 @@ test("no scope warning when all required scopes are granted", async () => {
     stdin,
     stdout,
     stderr,
+    claudeJsonPath: "/nonexistent",
     openBrowser: vi.fn(async () => undefined),
     inferRepo: vi.fn(async () => null),
     runAuthorizationFlow:
@@ -205,6 +209,7 @@ test("step 1 opens the workspace-specific consumers page when repo is inferred",
     stderr,
     openBrowser,
     inferRepo,
+    claudeJsonPath: "/nonexistent",
     runAuthorizationFlow:
       runAuthorizationFlow as unknown as typeof import("../auth/index.ts").runAuthorizationFlow,
   });
@@ -233,6 +238,7 @@ test("step 1 opens the generic workspaces page when repo inference returns null"
     stderr,
     openBrowser,
     inferRepo,
+    claudeJsonPath: "/nonexistent",
     runAuthorizationFlow:
       runAuthorizationFlow as unknown as typeof import("../auth/index.ts").runAuthorizationFlow,
   });
@@ -265,6 +271,7 @@ test("step 2 prompt for credentials appears only after user presses Enter on ste
     stderr,
     openBrowser,
     inferRepo,
+    claudeJsonPath: "/nonexistent",
     runAuthorizationFlow:
       runAuthorizationFlow as unknown as typeof import("../auth/index.ts").runAuthorizationFlow,
   });
@@ -292,6 +299,7 @@ test("runSetup writes creds, calls runAuthorizationFlow, prints success", async 
     stdin,
     stdout,
     stderr,
+    claudeJsonPath: "/nonexistent",
     openBrowser: vi.fn(async () => undefined),
     inferRepo: vi.fn(async () => null),
     runAuthorizationFlow:
@@ -335,6 +343,7 @@ test("empty client key re-prompts until non-empty", async () => {
     stdin,
     stdout,
     stderr,
+    claudeJsonPath: "/nonexistent",
     openBrowser: vi.fn(async () => undefined),
     inferRepo: vi.fn(async () => null),
     runAuthorizationFlow:
@@ -370,6 +379,7 @@ test("env-var fast-path: TTY accept skips Steps 1+2 and authorizes with env cred
       BITBUCKET_CLIENT_KEY: "env-key",
       BITBUCKET_CLIENT_SECRET: "env-secret",
     },
+    claudeJsonPath: "/nonexistent",
     openBrowser: vi.fn(async () => undefined),
     inferRepo: vi.fn(async () => null),
     runAuthorizationFlow:
@@ -403,6 +413,7 @@ test("env-var fast-path: TTY decline runs the full wizard, ignoring env vars", a
       BITBUCKET_CLIENT_KEY: "env-key",
       BITBUCKET_CLIENT_SECRET: "env-secret",
     },
+    claudeJsonPath: "/nonexistent",
     openBrowser: vi.fn(async () => undefined),
     inferRepo: vi.fn(async () => null),
     runAuthorizationFlow:
@@ -431,6 +442,7 @@ test("env-var fast-path: non-TTY uses env creds without prompting", async () => 
       BITBUCKET_CLIENT_KEY: "scripted-key",
       BITBUCKET_CLIENT_SECRET: "scripted-secret",
     },
+    claudeJsonPath: "/nonexistent",
     openBrowser: vi.fn(async () => undefined),
     inferRepo: vi.fn(async () => null),
     runAuthorizationFlow:
@@ -458,6 +470,7 @@ test("env-var fast-path: only one of two vars set is ignored", async () => {
     stdout,
     stderr,
     env: { BITBUCKET_CLIENT_KEY: "only-key" }, // missing SECRET
+    claudeJsonPath: "/nonexistent",
     openBrowser: vi.fn(async () => undefined),
     inferRepo: vi.fn(async () => null),
     runAuthorizationFlow:
@@ -489,6 +502,7 @@ test("runAuthorizationFlow throwing causes runSetup to throw and print error", a
       stdin,
       stdout,
       stderr,
+      claudeJsonPath: "/nonexistent",
       openBrowser: vi.fn(async () => undefined),
       inferRepo: vi.fn(async () => null),
       runAuthorizationFlow:
@@ -498,4 +512,193 @@ test("runAuthorizationFlow throwing causes runSetup to throw and print error", a
 
   expect(errOut.text()).toContain("Setup failed");
   expect(errOut.text()).toContain("browser flow failed");
+});
+
+// Helper: builds a minimal Claude config with a `bitbucket` entry of the
+// requested shape, written to a temp file and returns its path.
+function writeClaudeConfigFor(status: "absent" | "local-build" | "on-npx" | "unknown"): string {
+  let server: unknown = undefined;
+  if (status === "local-build") {
+    server = { type: "stdio", command: "/abs/dist/bitbucket-mcp.mjs", args: [] };
+  } else if (status === "on-npx") {
+    server = { type: "stdio", command: "npx", args: ["-y", "@bb-mcp/server"] };
+  } else if (status === "unknown") {
+    server = { type: "stdio", command: "node", args: ["/some/other.js"] };
+  }
+  const cfg = server === undefined ? {} : { mcpServers: { bitbucket: server } };
+  const p = path.join(tmpDir, ".claude.json");
+  fs.writeFileSync(p, JSON.stringify(cfg));
+  return p;
+}
+
+// Helper: writes a valid token blob into the bitbucket-mcp config so the
+// wizard sees "valid tokens".
+async function seedTokens(): Promise<void> {
+  const cfgDir = path.join(tmpDir, "bitbucket-mcp");
+  fs.mkdirSync(cfgDir, { recursive: true, mode: 0o700 });
+  const cfg = {
+    clientKey: "k",
+    clientSecret: "s",
+    tokens: {
+      accessToken: "a",
+      refreshToken: "r",
+      expiresAt: Date.now() + 3600_000,
+      scopes: ["account"],
+    },
+  };
+  fs.writeFileSync(path.join(cfgDir, "config.json"), JSON.stringify(cfg), { mode: 0o600 });
+}
+
+// ---------- Decision matrix ----------
+
+test("matrix: fresh install (no tokens, no registration) → full wizard", async () => {
+  const stdin = new PassThrough();
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  const out = collect(stdout);
+
+  script(stdin, ["", "k", "s"]);
+  const runAuthorizationFlow = vi.fn(async () => sampleTokens());
+
+  await runSetup({
+    stdin,
+    stdout,
+    stderr,
+    env: {},
+    claudeJsonPath: writeClaudeConfigFor("absent"),
+    claudeRunner: vi.fn(async () => ({ exitCode: 1, stdout: "", stderr: "" })) as ClaudeRunner,
+    openBrowser: vi.fn(async () => undefined),
+    inferRepo: vi.fn(async () => null),
+    runAuthorizationFlow:
+      runAuthorizationFlow as unknown as typeof import("../auth/index.ts").runAuthorizationFlow,
+  });
+
+  expect(runAuthorizationFlow).toHaveBeenCalled();
+  expect(out.text()).toContain("Step 1 of 3");
+});
+
+test("matrix: migrate (valid tokens + local-build registration) → re-register only, no OAuth", async () => {
+  const stdin = new PassThrough() as PassThrough & { isTTY?: boolean };
+  stdin.isTTY = true;
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  const out = collect(stdout);
+
+  await seedTokens();
+  script(stdin, [""]); // accept the migrate prompt with default Y
+
+  const runAuthorizationFlow = vi.fn(async () => sampleTokens());
+  const claudeRunner = vi.fn(async () => ({ exitCode: 0, stdout: "", stderr: "" }));
+
+  await runSetup({
+    stdin,
+    stdout,
+    stderr,
+    env: {},
+    claudeJsonPath: writeClaudeConfigFor("local-build"),
+    claudeRunner: claudeRunner as ClaudeRunner,
+    openBrowser: vi.fn(async () => undefined),
+    inferRepo: vi.fn(async () => null),
+    runAuthorizationFlow:
+      runAuthorizationFlow as unknown as typeof import("../auth/index.ts").runAuthorizationFlow,
+  });
+
+  expect(runAuthorizationFlow).not.toHaveBeenCalled();
+  expect(out.text()).toContain("local build");
+  // Should have called claude mcp remove and add-json (plus possibly --version probe).
+  const argLists = (claudeRunner.mock.calls as unknown as [string[]][])
+    .map((c) => c[0])
+    .map((a) => a.join(" "));
+  expect(argLists.some((s) => s.startsWith("mcp remove bitbucket"))).toBe(true);
+  expect(argLists.some((s) => s.startsWith("mcp add-json bitbucket"))).toBe(true);
+});
+
+test("matrix: already on npx → idempotent prompt, default declines", async () => {
+  const stdin = new PassThrough() as PassThrough & { isTTY?: boolean };
+  stdin.isTTY = true;
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  const out = collect(stdout);
+
+  await seedTokens();
+  script(stdin, [""]); // empty = accept default N (decline re-running OAuth)
+
+  const runAuthorizationFlow = vi.fn(async () => sampleTokens());
+
+  await runSetup({
+    stdin,
+    stdout,
+    stderr,
+    env: {},
+    claudeJsonPath: writeClaudeConfigFor("on-npx"),
+    claudeRunner: vi.fn(async () => ({ exitCode: 0, stdout: "", stderr: "" })) as ClaudeRunner,
+    openBrowser: vi.fn(async () => undefined),
+    inferRepo: vi.fn(async () => null),
+    runAuthorizationFlow:
+      runAuthorizationFlow as unknown as typeof import("../auth/index.ts").runAuthorizationFlow,
+  });
+
+  expect(runAuthorizationFlow).not.toHaveBeenCalled();
+  expect(out.text()).toContain("already set up");
+});
+
+test("matrix: register-only (valid tokens + no registration) → register without OAuth", async () => {
+  const stdin = new PassThrough() as PassThrough & { isTTY?: boolean };
+  stdin.isTTY = true;
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+
+  await seedTokens();
+  script(stdin, [""]); // accept default Y
+
+  const runAuthorizationFlow = vi.fn(async () => sampleTokens());
+  const claudeRunner = vi.fn(async () => ({ exitCode: 0, stdout: "", stderr: "" }));
+
+  await runSetup({
+    stdin,
+    stdout,
+    stderr,
+    env: {},
+    claudeJsonPath: writeClaudeConfigFor("absent"),
+    claudeRunner: claudeRunner as ClaudeRunner,
+    openBrowser: vi.fn(async () => undefined),
+    inferRepo: vi.fn(async () => null),
+    runAuthorizationFlow:
+      runAuthorizationFlow as unknown as typeof import("../auth/index.ts").runAuthorizationFlow,
+  });
+
+  expect(runAuthorizationFlow).not.toHaveBeenCalled();
+  const argLists = (claudeRunner.mock.calls as unknown as [string[]][])
+    .map((c) => c[0])
+    .map((a) => a.join(" "));
+  expect(argLists.some((s) => s.startsWith("mcp add-json bitbucket"))).toBe(true);
+});
+
+test("matrix: unknown shape → warn and replace with confirmation", async () => {
+  const stdin = new PassThrough() as PassThrough & { isTTY?: boolean };
+  stdin.isTTY = true;
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  const out = collect(stdout);
+
+  await seedTokens();
+  script(stdin, [""]); // accept default Y
+
+  const claudeRunner = vi.fn(async () => ({ exitCode: 0, stdout: "", stderr: "" }));
+
+  await runSetup({
+    stdin,
+    stdout,
+    stderr,
+    env: {},
+    claudeJsonPath: writeClaudeConfigFor("unknown"),
+    claudeRunner: claudeRunner as ClaudeRunner,
+    openBrowser: vi.fn(async () => undefined),
+    inferRepo: vi.fn(async () => null),
+    runAuthorizationFlow: vi.fn(async () =>
+      sampleTokens(),
+    ) as unknown as typeof import("../auth/index.ts").runAuthorizationFlow,
+  });
+
+  expect(out.text()).toContain("doesn't match a known shape");
 });

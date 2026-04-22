@@ -1,3 +1,4 @@
+import * as fs from "node:fs";
 import * as nodePath from "node:path";
 import * as readline from "node:readline/promises";
 import open from "open";
@@ -5,6 +6,16 @@ import {
   CALLBACK_PORT,
   runAuthorizationFlow as defaultRunAuthorizationFlow,
 } from "../auth/index.ts";
+import {
+  classifyBitbucketRegistration,
+  defaultClaudeJsonPath,
+  defaultClaudeRunner,
+  registerBitbucketServer,
+  removeBitbucketServer,
+  type ClaudeConfig,
+  type ClaudeRunner,
+  type RegistrationStatus,
+} from "../claude-cli/index.ts";
 import { configPath, writeConfig } from "../config/index.ts";
 import { inferBitbucketRepo as defaultInferBitbucketRepo } from "../git/index.ts";
 import type { RepoTarget, StoredTokens } from "../types.ts";
@@ -18,6 +29,8 @@ export type SetupOptions = {
   openBrowser?: (url: string) => Promise<unknown>;
   inferRepo?: () => Promise<RepoTarget | null>;
   binPath?: string;
+  claudeJsonPath?: string;
+  claudeRunner?: ClaudeRunner;
 };
 
 const GENERIC_WORKSPACES_URL = "https://bitbucket.org/account/workspaces/";
@@ -112,12 +125,27 @@ export async function runSetup(opts: SetupOptions = {}): Promise<void> {
       : "/absolute/path/to/dist/bitbucket-mcp.mjs");
 
   const env = opts.env ?? process.env;
+  const claudeJsonPath = opts.claudeJsonPath ?? defaultClaudeJsonPath();
+  const claudeRunner = opts.claudeRunner ?? defaultClaudeRunner;
 
   // Detect team-shared mode: both env vars present and non-empty.
   const envKey = env["BITBUCKET_CLIENT_KEY"];
   const envSecret = env["BITBUCKET_CLIENT_SECRET"];
   const envCredsAvailable =
     envKey !== undefined && envKey.length > 0 && envSecret !== undefined && envSecret.length > 0;
+
+  // --------- State detection (sync reads, before readline!) ---------
+  // IMPORTANT: readline fires "line" events immediately when stdin has buffered
+  // data. If a "line" event fires while no rl.question() is pending, the line
+  // is lost. Test harnesses feed input via setImmediate chains; each `await`
+  // here lets a setImmediate callback fire, feeding a line before readline is
+  // even created. Using synchronous reads avoids any event-loop yield, so
+  // setImmediate callbacks haven't fired when readline is subsequently created,
+  // and all test input lines are safely waiting in the PassThrough buffer.
+  const hasValidTokens = readHasValidTokensSync();
+  const claudeConfig = readClaudeConfigSync(claudeJsonPath);
+  const status: RegistrationStatus = classifyBitbucketRegistration(claudeConfig);
+  const stdinIsTty = (stdin as { isTTY?: boolean }).isTTY === true;
 
   // terminal:false keeps readline in pure line-mode: no ANSI, no history, no
   // raw key processing. That matters when stdin/stdout aren't real TTYs (e.g.
@@ -127,7 +155,6 @@ export async function runSetup(opts: SetupOptions = {}): Promise<void> {
     // --------- Env-var fast-path (team-shared mode) ---------
     let envCredsAccepted = false;
     if (envCredsAvailable) {
-      const stdinIsTty = (stdin as { isTTY?: boolean }).isTTY === true;
       if (stdinIsTty) {
         stdout.write(
           [
@@ -162,6 +189,73 @@ export async function runSetup(opts: SetupOptions = {}): Promise<void> {
         return; // skip the full 3-step wizard entirely
       }
     }
+
+    // Decision matrix — early exits for non-fresh-install flows.
+    if (hasValidTokens && status.kind === "local-build") {
+      stdout.write(
+        [
+          "bitbucket-mcp setup",
+          "───────────────────",
+          "Looks like you've set up bitbucket-mcp before from a local build.",
+          `  Existing registration: ${status.command}`,
+          "Re-register to use the new npx-based install (no re-auth needed)? [Y/n] ",
+        ].join("\n"),
+      );
+      const answer = stdinIsTty ? (await rl.question("")).trim().toLowerCase() : "y";
+      if (answer === "" || answer === "y" || answer === "yes") {
+        await reregisterOnly({ stdout, stderr, claudeRunner });
+      }
+      return;
+    }
+
+    if (hasValidTokens && status.kind === "on-npx") {
+      stdout.write(
+        [
+          "bitbucket-mcp setup",
+          "───────────────────",
+          "You're already set up. Re-run OAuth (e.g. to add a new scope)? [y/N] ",
+        ].join("\n"),
+      );
+      const answer = stdinIsTty ? (await rl.question("")).trim().toLowerCase() : "n";
+      if (!(answer === "y" || answer === "yes")) {
+        return;
+      }
+      // Fall through to full wizard if user accepted re-auth.
+    }
+
+    if (hasValidTokens && status.kind === "absent") {
+      stdout.write(
+        [
+          "bitbucket-mcp setup",
+          "───────────────────",
+          "Tokens are saved but bitbucket isn't registered with Claude Code.",
+          "Register it now? [Y/n] ",
+        ].join("\n"),
+      );
+      const answer = stdinIsTty ? (await rl.question("")).trim().toLowerCase() : "y";
+      if (answer === "" || answer === "y" || answer === "yes") {
+        await reregisterOnly({ stdout, stderr, claudeRunner });
+      }
+      return;
+    }
+
+    if (hasValidTokens && status.kind === "unknown-shape") {
+      stdout.write(
+        [
+          "bitbucket-mcp setup",
+          "───────────────────",
+          `An existing 'bitbucket' MCP server is registered but doesn't match a known shape`,
+          `(command: ${status.command}). Replace it with the npx install? [Y/n] `,
+        ].join("\n"),
+      );
+      const answer = stdinIsTty ? (await rl.question("")).trim().toLowerCase() : "y";
+      if (answer === "" || answer === "y" || answer === "yes") {
+        await reregisterOnly({ stdout, stderr, claudeRunner });
+      }
+      return;
+    }
+
+    // Otherwise: fresh install — fall through to the existing 3-step wizard.
 
     stdout.write(
       [
@@ -219,6 +313,58 @@ export async function runSetup(opts: SetupOptions = {}): Promise<void> {
     throw err;
   } finally {
     rl.close();
+  }
+}
+
+/**
+ * Synchronously reads the bitbucket-mcp config and returns true if valid
+ * tokens (non-empty refreshToken) are present. Returns false if the file
+ * doesn't exist or tokens are absent. Uses sync I/O intentionally — see the
+ * "State detection" comment in runSetup for the reason.
+ */
+function readHasValidTokensSync(): boolean {
+  try {
+    const raw = fs.readFileSync(configPath(), "utf8");
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const tokens = parsed["tokens"] as Record<string, unknown> | undefined;
+    const refreshToken = tokens?.["refreshToken"];
+    return typeof refreshToken === "string" && refreshToken.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Synchronously reads the Claude Code config at the given path and returns the
+ * parsed object, or null if the file doesn't exist. Uses sync I/O intentionally
+ * — see the "State detection" comment in runSetup.
+ */
+function readClaudeConfigSync(filePath: string): ClaudeConfig | null {
+  try {
+    return JSON.parse(fs.readFileSync(filePath, "utf8")) as ClaudeConfig;
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    if (e.code === "ENOENT") return null;
+    // Parse errors fall through to returning null (same as async version's .catch)
+    return null;
+  }
+}
+
+async function reregisterOnly(p: {
+  stdout: NodeJS.WritableStream;
+  stderr: NodeJS.WritableStream;
+  claudeRunner: ClaudeRunner;
+}): Promise<void> {
+  try {
+    await removeBitbucketServer({ run: p.claudeRunner });
+    await registerBitbucketServer({ run: p.claudeRunner });
+    p.stdout.write("\n✅ Re-registered bitbucket MCP server with the npx install.\n");
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    p.stderr.write(`\nFailed to register: ${msg}\n`);
+    p.stdout.write(
+      `\nManual command:\n  claude mcp add-json bitbucket --scope user '<json from \`@bb-mcp/server print-config\`>'\n`,
+    );
   }
 }
 
