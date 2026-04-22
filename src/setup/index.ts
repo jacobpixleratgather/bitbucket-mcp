@@ -319,8 +319,13 @@ export async function runSetup(opts: SetupOptions = {}): Promise<void> {
 /**
  * Synchronously reads the bitbucket-mcp config and returns true if valid
  * tokens (non-empty refreshToken) are present. Returns false if the file
- * doesn't exist or tokens are absent. Uses sync I/O intentionally — see the
- * "State detection" comment in runSetup for the reason.
+ * doesn't exist or tokens are absent.
+ *
+ * DO NOT REPLACE with the async `readConfig` from ../config/index.ts:
+ * doing so introduces an `await` in the state-detection phase, which lets
+ * setImmediate-fed test input lines fire as readline `line` events before
+ * any `rl.question()` is pending — and those lines are dropped. See the
+ * "State detection" comment inside runSetup for the full explanation.
  */
 function readHasValidTokensSync(): boolean {
   try {
@@ -335,9 +340,12 @@ function readHasValidTokensSync(): boolean {
 }
 
 /**
- * Synchronously reads the Claude Code config at the given path and returns the
- * parsed object, or null if the file doesn't exist. Uses sync I/O intentionally
- * — see the "State detection" comment in runSetup.
+ * Synchronously reads the Claude Code config at the given path and returns
+ * the parsed object, or null if the file doesn't exist or cannot be parsed.
+ *
+ * DO NOT REPLACE with the async `readClaudeConfig` from ../claude-cli/index.ts:
+ * see the "DO NOT REPLACE" note on `readHasValidTokensSync` above and the
+ * "State detection" comment inside runSetup.
  */
 function readClaudeConfigSync(filePath: string): ClaudeConfig | null {
   try {
@@ -350,6 +358,18 @@ function readClaudeConfigSync(filePath: string): ClaudeConfig | null {
   }
 }
 
+/**
+ * Removes any existing 'bitbucket' MCP server registration and registers the
+ * npx-based one. Used for the migrate / register-only / unknown-shape flows.
+ *
+ * Spec deviation: the design doc's "Error handling" section says
+ * `claude mcp remove fails when migrating — abort the migration with the
+ * error`. This implementation instead catches errors from BOTH remove and
+ * add, then prints the manual command. Rationale: the user's OAuth tokens
+ * are intact, so a working manual command is friendlier than an abort.
+ * The plan (Task 6, "Note on a deliberate spec deviation") pre-authorizes
+ * this choice.
+ */
 async function reregisterOnly(p: {
   stdout: NodeJS.WritableStream;
   stderr: NodeJS.WritableStream;
