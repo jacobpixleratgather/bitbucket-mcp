@@ -347,6 +347,129 @@ test("empty client key re-prompts until non-empty", async () => {
   });
 });
 
+// ---------- Env-var fast-path ----------
+
+test("env-var fast-path: TTY accept skips Steps 1+2 and authorizes with env creds", async () => {
+  const stdin = new PassThrough() as PassThrough & { isTTY?: boolean };
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  const out = collect(stdout);
+
+  // Force the TTY branch so the prompt is reachable.
+  stdin.isTTY = true;
+  // Single line answer for the env-var prompt.
+  script(stdin, [""]); // empty = accept default Y
+
+  const runAuthorizationFlow = vi.fn(async () => sampleTokens());
+
+  await runSetup({
+    stdin,
+    stdout,
+    stderr,
+    env: {
+      BITBUCKET_CLIENT_KEY: "env-key",
+      BITBUCKET_CLIENT_SECRET: "env-secret",
+    },
+    openBrowser: vi.fn(async () => undefined),
+    inferRepo: vi.fn(async () => null),
+    runAuthorizationFlow:
+      runAuthorizationFlow as unknown as typeof import("../auth/index.ts").runAuthorizationFlow,
+  });
+
+  expect(runAuthorizationFlow).toHaveBeenCalledWith({
+    clientKey: "env-key",
+    clientSecret: "env-secret",
+  });
+  // Step 1's "Add consumer" instructions must NOT appear.
+  expect(out.text()).not.toContain("Add consumer");
+});
+
+test("env-var fast-path: TTY decline runs the full wizard, ignoring env vars", async () => {
+  const stdin = new PassThrough() as PassThrough & { isTTY?: boolean };
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+
+  stdin.isTTY = true;
+  // First answer = "n" (decline env-var prompt). Then full wizard: Enter, key, secret.
+  script(stdin, ["n", "", "typed-key", "typed-secret"]);
+
+  const runAuthorizationFlow = vi.fn(async () => sampleTokens());
+
+  await runSetup({
+    stdin,
+    stdout,
+    stderr,
+    env: {
+      BITBUCKET_CLIENT_KEY: "env-key",
+      BITBUCKET_CLIENT_SECRET: "env-secret",
+    },
+    openBrowser: vi.fn(async () => undefined),
+    inferRepo: vi.fn(async () => null),
+    runAuthorizationFlow:
+      runAuthorizationFlow as unknown as typeof import("../auth/index.ts").runAuthorizationFlow,
+  });
+
+  expect(runAuthorizationFlow).toHaveBeenCalledWith({
+    clientKey: "typed-key",
+    clientSecret: "typed-secret",
+  });
+});
+
+test("env-var fast-path: non-TTY uses env creds without prompting", async () => {
+  const stdin = new PassThrough() as PassThrough & { isTTY?: boolean };
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+
+  // No isTTY override → defaults undefined, treated as non-TTY.
+  const runAuthorizationFlow = vi.fn(async () => sampleTokens());
+
+  await runSetup({
+    stdin,
+    stdout,
+    stderr,
+    env: {
+      BITBUCKET_CLIENT_KEY: "scripted-key",
+      BITBUCKET_CLIENT_SECRET: "scripted-secret",
+    },
+    openBrowser: vi.fn(async () => undefined),
+    inferRepo: vi.fn(async () => null),
+    runAuthorizationFlow:
+      runAuthorizationFlow as unknown as typeof import("../auth/index.ts").runAuthorizationFlow,
+  });
+
+  expect(runAuthorizationFlow).toHaveBeenCalledWith({
+    clientKey: "scripted-key",
+    clientSecret: "scripted-secret",
+  });
+});
+
+test("env-var fast-path: only one of two vars set is ignored", async () => {
+  const stdin = new PassThrough();
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+
+  // No env-var prompt should appear; full wizard runs.
+  script(stdin, ["", "typed-key", "typed-secret"]);
+
+  const runAuthorizationFlow = vi.fn(async () => sampleTokens());
+
+  await runSetup({
+    stdin,
+    stdout,
+    stderr,
+    env: { BITBUCKET_CLIENT_KEY: "only-key" }, // missing SECRET
+    openBrowser: vi.fn(async () => undefined),
+    inferRepo: vi.fn(async () => null),
+    runAuthorizationFlow:
+      runAuthorizationFlow as unknown as typeof import("../auth/index.ts").runAuthorizationFlow,
+  });
+
+  expect(runAuthorizationFlow).toHaveBeenCalledWith({
+    clientKey: "typed-key",
+    clientSecret: "typed-secret",
+  });
+});
+
 // ---------- Failure path ----------
 
 test("runAuthorizationFlow throwing causes runSetup to throw and print error", async () => {

@@ -7,12 +7,13 @@ import {
 } from "../auth/index.ts";
 import { configPath, writeConfig } from "../config/index.ts";
 import { inferBitbucketRepo as defaultInferBitbucketRepo } from "../git/index.ts";
-import type { RepoTarget } from "../types.ts";
+import type { RepoTarget, StoredTokens } from "../types.ts";
 
 export type SetupOptions = {
   stdin?: NodeJS.ReadableStream;
   stdout?: NodeJS.WritableStream;
   stderr?: NodeJS.WritableStream;
+  env?: NodeJS.ProcessEnv;
   runAuthorizationFlow?: typeof defaultRunAuthorizationFlow;
   openBrowser?: (url: string) => Promise<unknown>;
   inferRepo?: () => Promise<RepoTarget | null>;
@@ -66,6 +67,31 @@ function step1Instructions(consumerUrl: string, includePickWorkspaceHint: boolea
   ].join("\n");
 }
 
+function printAuthSuccess(p: {
+  stdout: NodeJS.WritableStream;
+  tokens: StoredTokens;
+  binPath: string;
+}): void {
+  const grantedSet = new Set(p.tokens.scopes);
+  const missing = REQUIRED_SCOPES.filter((s) => !grantedSet.has(s));
+  const scopesText = p.tokens.scopes.length > 0 ? p.tokens.scopes.join(", ") : "(none reported)";
+  p.stdout.write(
+    `\n✅ Authentication complete. Scopes granted: ${scopesText}\n  Tokens saved to ${configPath()}.\n`,
+  );
+  if (missing.length > 0) {
+    p.stdout.write(
+      [
+        "",
+        `⚠ The consumer is missing scope${missing.length === 1 ? "" : "s"}: ${missing.join(", ")}`,
+        "  Some tools will fail until you re-open the consumer in Bitbucket",
+        "  and tick the missing permissions.",
+        "",
+      ].join("\n"),
+    );
+  }
+  p.stdout.write(`\nNext: add this to your MCP host config:\n  { "command": "${p.binPath}" }\n`);
+}
+
 /**
  * Runs the interactive first-run setup wizard.
  *
@@ -85,11 +111,58 @@ export async function runSetup(opts: SetupOptions = {}): Promise<void> {
       ? nodePath.resolve(process.argv[1])
       : "/absolute/path/to/dist/bitbucket-mcp.mjs");
 
+  const env = opts.env ?? process.env;
+
+  // Detect team-shared mode: both env vars present and non-empty.
+  const envKey = env["BITBUCKET_CLIENT_KEY"];
+  const envSecret = env["BITBUCKET_CLIENT_SECRET"];
+  const envCredsAvailable =
+    envKey !== undefined && envKey.length > 0 && envSecret !== undefined && envSecret.length > 0;
+
   // terminal:false keeps readline in pure line-mode: no ANSI, no history, no
   // raw key processing. That matters when stdin/stdout aren't real TTYs (e.g.
   // tests pipe PassThroughs) and is harmless when they are.
   const rl = readline.createInterface({ input: stdin, output: stdout, terminal: false });
   try {
+    // --------- Env-var fast-path (team-shared mode) ---------
+    let envCredsAccepted = false;
+    if (envCredsAvailable) {
+      const stdinIsTty = (stdin as { isTTY?: boolean }).isTTY === true;
+      if (stdinIsTty) {
+        stdout.write(
+          [
+            "bitbucket-mcp setup",
+            "───────────────────",
+            "Detected BITBUCKET_CLIENT_KEY and BITBUCKET_CLIENT_SECRET in your",
+            "environment. Use them and skip the create-consumer step? [Y/n] ",
+          ].join("\n"),
+        );
+        const answer = (await rl.question("")).trim().toLowerCase();
+        envCredsAccepted = answer === "" || answer === "y" || answer === "yes";
+      } else {
+        envCredsAccepted = true; // non-TTY: scripted run, use silently
+      }
+
+      if (envCredsAccepted) {
+        await writeConfig({ clientKey: envKey!, clientSecret: envSecret! });
+        stdout.write(
+          [
+            "",
+            "Step 1 of 1 — Authorize",
+            "───────────────────────",
+            "Opening your browser to authorize…",
+            "",
+          ].join("\n"),
+        );
+        const tokens = await runAuthorizationFlow({
+          clientKey: envKey!,
+          clientSecret: envSecret!,
+        });
+        printAuthSuccess({ stdout, tokens, binPath });
+        return; // skip the full 3-step wizard entirely
+      }
+    }
+
     stdout.write(
       [
         "bitbucket-mcp setup",
@@ -139,25 +212,7 @@ export async function runSetup(opts: SetupOptions = {}): Promise<void> {
       ].join("\n"),
     );
     const tokens = await runAuthorizationFlow({ clientKey, clientSecret });
-
-    const grantedSet = new Set(tokens.scopes);
-    const missing = REQUIRED_SCOPES.filter((s) => !grantedSet.has(s));
-    const scopesText = tokens.scopes.length > 0 ? tokens.scopes.join(", ") : "(none reported)";
-    stdout.write(
-      `\n\u2705 Authentication complete. Scopes granted: ${scopesText}\n  Tokens saved to ${configPath()}.\n`,
-    );
-    if (missing.length > 0) {
-      stdout.write(
-        [
-          "",
-          `\u26a0 The consumer is missing scope${missing.length === 1 ? "" : "s"}: ${missing.join(", ")}`,
-          "  Some tools will fail until you re-open the consumer in Bitbucket",
-          "  and tick the missing permissions.",
-          "",
-        ].join("\n"),
-      );
-    }
-    stdout.write(`\nNext: add this to your MCP host config:\n  { "command": "${binPath}" }\n`);
+    printAuthSuccess({ stdout, tokens, binPath });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     stderr.write(`\nSetup failed: ${msg}\n`);
