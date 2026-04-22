@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -91,8 +92,6 @@ function isNodeError(err: unknown): err is NodeJS.ErrnoException {
   return err instanceof Error && "code" in err;
 }
 
-import { spawn } from "node:child_process";
-
 /**
  * Abstraction over `spawn('claude', args)`. Tests inject a fake; the real
  * runner uses node:child_process. All callers go through this so behavior is
@@ -117,7 +116,7 @@ export const defaultClaudeRunner: ClaudeRunner = async (args) => {
     child.on("error", reject);
     child.on("close", (code) => {
       resolve({
-        exitCode: code ?? 0,
+        exitCode: code ?? 1,
         stdout: Buffer.concat(out).toString("utf8"),
         stderr: Buffer.concat(err).toString("utf8"),
       });
@@ -151,7 +150,9 @@ export async function registerBitbucketServer(opts: { run: ClaudeRunner }): Prom
   const payload = JSON.stringify({
     type: "stdio",
     command: "npx",
-    args: ["-y", "@bb-mcp/server"],
+    // Must match classifyBitbucketRegistration's NPX_PACKAGE check exactly —
+    // do NOT pin a version, or `setup` will re-migrate every run.
+    args: ["-y", NPX_PACKAGE],
     env: {},
   });
   const result = await opts.run(["mcp", "add-json", "bitbucket", payload, "--scope", "user"]);
