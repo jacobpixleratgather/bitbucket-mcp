@@ -439,6 +439,42 @@ test("addPrComment posts correct body", async () => {
   });
 });
 
+// ---------- replyToPrComment ----------
+
+test("replyToPrComment posts body with parent.id", async () => {
+  const { fetch, calls } = makeScriptedFetch([
+    {
+      status: 201,
+      body: JSON.stringify({
+        id: 21,
+        content: { raw: "thanks, fixed" },
+        user: { display_name: "u", uuid: "x" },
+        created_on: "2026-04-21T00:00:00Z",
+        updated_on: "2026-04-21T00:00:00Z",
+        parent: { id: 17 },
+      }),
+    },
+  ]);
+  const client = new BitbucketClient({
+    getAccessToken: async () => "t",
+    fetch,
+  });
+  const reply = await client.replyToPrComment(
+    { workspace: "ws", repo: "repo", prId: 42 },
+    17,
+    "thanks, fixed",
+  );
+  expect(reply.id).toBe(21);
+  expect(calls[0]?.method).toBe("POST");
+  expect(calls[0]?.url).toBe(
+    "https://api.bitbucket.org/2.0/repositories/ws/repo/pullrequests/42/comments",
+  );
+  expect(JSON.parse(calls[0]?.body ?? "")).toEqual({
+    content: { raw: "thanks, fixed" },
+    parent: { id: 17 },
+  });
+});
+
 // ---------- addPrInlineComment ----------
 
 test('addPrInlineComment side="new" uses inline.to', async () => {

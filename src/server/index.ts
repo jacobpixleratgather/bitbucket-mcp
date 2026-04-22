@@ -316,6 +316,22 @@ export async function handleAddPrComment(
   });
 }
 
+export async function handleReplyToPrComment(
+  deps: HandlerDeps,
+  args: { workspace?: string; repo?: string; pr_id?: number; comment_id: number; body: string },
+): Promise<ToolResult> {
+  return safely(async () => {
+    const repo = await resolveRepo(deps, args);
+    if (repo === null) return errorResult(NO_REPO_MESSAGE);
+    const resolved = await resolvePrTarget(deps, repo, args.pr_id);
+    if (!resolved.ok) return errorResult(resolved.error);
+    const reply = await deps.client.replyToPrComment(resolved.target, args.comment_id, args.body);
+    return textResult(
+      `Posted reply #${reply.id} to comment #${args.comment_id}\n${JSON.stringify(reply, null, 2)}`,
+    );
+  });
+}
+
 export async function handleAddPrInlineComment(
   deps: HandlerDeps,
   args: {
@@ -486,6 +502,23 @@ function registerTools(server: McpServer, deps: HandlerDeps): void {
       annotations: { title: "Add PR comment", ...WRITE },
     },
     async (args) => handleAddPrComment(deps, args),
+  );
+
+  server.registerTool(
+    "reply_to_pr_comment",
+    {
+      title: "Reply to PR comment",
+      description:
+        "Reply to an existing PR comment, creating a threaded reply. For inline comments, the path and line are inherited from the parent — do not use `add_pr_inline_comment` to reply, since that posts a sibling comment instead of a threaded reply.",
+      inputSchema: {
+        ...workspaceRepoShape,
+        ...prIdShape,
+        comment_id: z.number().int().positive().describe("ID of the comment to reply to."),
+        body: z.string().min(1).describe("Reply body (Markdown)."),
+      },
+      annotations: { title: "Reply to PR comment", ...WRITE },
+    },
+    async (args) => handleReplyToPrComment(deps, args),
   );
 
   server.registerTool(

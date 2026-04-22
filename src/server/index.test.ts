@@ -20,6 +20,7 @@ import {
   handleGetPrPipelineStatus,
   handleListPrComments,
   handleListPrs,
+  handleReplyToPrComment,
   type HandlerDeps,
   type ToolResult,
 } from "./index.ts";
@@ -36,6 +37,7 @@ function makeClientMock(overrides: Partial<BitbucketClient> = {}): BitbucketClie
     addPrInlineComment: vi.fn(),
     getPrPipelineStatus: vi.fn(),
     getPipelineStepLog: vi.fn(),
+    replyToPrComment: vi.fn(),
   };
   return Object.assign(base, overrides) as unknown as BitbucketClient;
 }
@@ -90,7 +92,7 @@ function extractText(result: ToolResult): string {
 
 // ---------- createServer + server wiring ----------
 
-test("createServer registers the 8 expected tools", () => {
+test("createServer registers the 9 expected tools", () => {
   const server = createServer({
     client: makeClientMock(),
     inferRepo: async () => ({ workspace: "ws", repo: "r" }),
@@ -111,6 +113,7 @@ test("createServer registers the 8 expected tools", () => {
       "get_pr_pipeline_status",
       "list_pr_comments",
       "list_prs",
+      "reply_to_pr_comment",
     ].sort(),
   );
 });
@@ -410,6 +413,28 @@ test("add_pr_inline_comment defaults side to 'new'", async () => {
     throw new Error("expected call");
   }
   expect(call[1].side).toBe("new");
+});
+
+test("reply_to_pr_comment passes parent id through and reports it", async () => {
+  const reply = sampleComment(77, "thanks");
+  reply.parent = { id: 17 };
+  const replyToPrComment = vi.fn(async () => reply);
+  const client = makeClientMock({ replyToPrComment });
+  const deps = makeDeps({ client });
+
+  const result = await handleReplyToPrComment(deps, {
+    pr_id: 7,
+    comment_id: 17,
+    body: "thanks",
+  });
+
+  expect(result.isError).toBeFalsy();
+  expect(replyToPrComment).toHaveBeenCalledWith(
+    { workspace: "ws", repo: "r", prId: 7 },
+    17,
+    "thanks",
+  );
+  expect(extractText(result).startsWith("Posted reply #77 to comment #17")).toBe(true);
 });
 
 // ---------- Error handling ----------

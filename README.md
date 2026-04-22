@@ -19,10 +19,11 @@ Read-only:
 
 Write:
 
-| Tool                    | Description                                              |
-| ----------------------- | -------------------------------------------------------- |
-| `add_pr_comment`        | Post a general comment on a PR.                          |
-| `add_pr_inline_comment` | Post a comment on a specific file + line in a PR's diff. |
+| Tool                    | Description                                                          |
+| ----------------------- | -------------------------------------------------------------------- |
+| `add_pr_comment`        | Post a general comment on a PR.                                      |
+| `add_pr_inline_comment` | Post a comment on a specific file + line in a PR's diff.             |
+| `reply_to_pr_comment`   | Post a threaded reply to an existing PR comment (general or inline). |
 
 All tools accept optional `workspace` and `repo`. When you run the server from inside a git checkout, those are inferred from the `origin` remote. PR-scoped tools accept an optional `pr_id`; when omitted, the server resolves it by listing open PRs whose source branch matches the current checked-out branch.
 

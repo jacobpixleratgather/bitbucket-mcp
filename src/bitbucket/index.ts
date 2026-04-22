@@ -125,6 +125,16 @@ export class BitbucketClient {
     });
   }
 
+  async replyToPrComment(t: PrTarget, parentId: number, body: string): Promise<BitbucketComment> {
+    const url = `${BASE_URL}/repositories/${encode(t.workspace)}/${encode(
+      t.repo,
+    )}/pullrequests/${t.prId}/comments`;
+    return await this.#requestJson<BitbucketComment>(url, {
+      method: "POST",
+      json: { content: { raw: body }, parent: { id: parentId } },
+    });
+  }
+
   async addPrInlineComment(
     t: PrTarget,
     args: { body: string; path: string; line: number; side?: "new" | "old" },
