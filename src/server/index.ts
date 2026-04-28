@@ -332,6 +332,55 @@ export async function handleReplyToPrComment(
   });
 }
 
+export async function handleUpdatePr(
+  deps: HandlerDeps,
+  args: {
+    workspace?: string;
+    repo?: string;
+    pr_id?: number;
+    title?: string;
+    description?: string;
+  },
+): Promise<ToolResult> {
+  return safely(async () => {
+    if (args.title === undefined && args.description === undefined) {
+      return errorResult("Pass at least one of `title` or `description` to update.");
+    }
+    const repo = await resolveRepo(deps, args);
+    if (repo === null) return errorResult(NO_REPO_MESSAGE);
+    const resolved = await resolvePrTarget(deps, repo, args.pr_id);
+    if (!resolved.ok) return errorResult(resolved.error);
+    const updated = await deps.client.updatePr(resolved.target, {
+      title: args.title,
+      description: args.description,
+    });
+    return textResult(`Updated PR #${updated.id}\n${JSON.stringify(updated, null, 2)}`);
+  });
+}
+
+export async function handleResolvePrComment(
+  deps: HandlerDeps,
+  args: {
+    workspace?: string;
+    repo?: string;
+    pr_id?: number;
+    comment_id: number;
+    resolved?: boolean;
+  },
+): Promise<ToolResult> {
+  return safely(async () => {
+    const repo = await resolveRepo(deps, args);
+    if (repo === null) return errorResult(NO_REPO_MESSAGE);
+    const resolved = await resolvePrTarget(deps, repo, args.pr_id);
+    if (!resolved.ok) return errorResult(resolved.error);
+    const wantResolved = args.resolved ?? true;
+    const out = await deps.client.resolvePrComment(resolved.target, args.comment_id, wantResolved);
+    const verb = wantResolved ? "resolved" : "unresolved";
+    const tail = out !== undefined ? `\n${JSON.stringify(out, null, 2)}` : "";
+    return textResult(`Marked comment #${args.comment_id} ${verb}${tail}`);
+  });
+}
+
 export async function handleAddPrInlineComment(
   deps: HandlerDeps,
   args: {
@@ -522,6 +571,52 @@ function registerTools(server: McpServer, deps: HandlerDeps): void {
   );
 
   server.registerTool(
+    "update_pr",
+    {
+      title: "Update PR",
+      description:
+        "Update a pull request's title and/or description (the PR Overview). Pass either or both — fields you omit are left unchanged. The description is interpreted as Markdown.",
+      inputSchema: {
+        ...workspaceRepoShape,
+        ...prIdShape,
+        title: z.string().min(1).optional().describe("New PR title."),
+        description: z
+          .string()
+          .optional()
+          .describe("New PR description (Markdown). Pass an empty string to clear it."),
+      },
+      annotations: { title: "Update PR", ...WRITE },
+    },
+    async (args) => handleUpdatePr(deps, args),
+  );
+
+  server.registerTool(
+    "resolve_pr_comment",
+    {
+      title: "Resolve PR comment",
+      description:
+        "Mark a PR comment as resolved or unresolved. Defaults to resolved=true. Use `list_pr_comments` to see current resolution state.",
+      inputSchema: {
+        ...workspaceRepoShape,
+        ...prIdShape,
+        comment_id: z.number().int().positive().describe("ID of the comment to (un)resolve."),
+        resolved: z
+          .boolean()
+          .optional()
+          .describe("True to mark resolved (default), false to unresolve."),
+      },
+      annotations: {
+        title: "Resolve PR comment",
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
+      },
+    },
+    async (args) => handleResolvePrComment(deps, args),
+  );
+
+  server.registerTool(
     "add_pr_inline_comment",
     {
       title: "Add PR inline comment",
@@ -574,6 +669,7 @@ function stripComment(c: BitbucketComment): {
   body: string;
   created_on: string;
   updated_on: string;
+  resolved: boolean;
   inline?: { path: string; line_new?: number; line_old?: number };
   parent_id?: number;
 } {
@@ -583,6 +679,7 @@ function stripComment(c: BitbucketComment): {
     body: string;
     created_on: string;
     updated_on: string;
+    resolved: boolean;
     inline?: { path: string; line_new?: number; line_old?: number };
     parent_id?: number;
   } = {
@@ -591,6 +688,7 @@ function stripComment(c: BitbucketComment): {
     body: c.content.raw,
     created_on: c.created_on,
     updated_on: c.updated_on,
+    resolved: c.resolution !== undefined && c.resolution !== null,
   };
   if (c.inline !== undefined) {
     const inline: { path: string; line_new?: number; line_old?: number } = {

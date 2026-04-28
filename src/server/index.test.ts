@@ -21,6 +21,8 @@ import {
   handleListPrComments,
   handleListPrs,
   handleReplyToPrComment,
+  handleResolvePrComment,
+  handleUpdatePr,
   type HandlerDeps,
   type ToolResult,
 } from "./index.ts";
@@ -38,6 +40,8 @@ function makeClientMock(overrides: Partial<BitbucketClient> = {}): BitbucketClie
     getPrPipelineStatus: vi.fn(),
     getPipelineStepLog: vi.fn(),
     replyToPrComment: vi.fn(),
+    updatePr: vi.fn(),
+    resolvePrComment: vi.fn(),
   };
   return Object.assign(base, overrides) as unknown as BitbucketClient;
 }
@@ -92,7 +96,7 @@ function extractText(result: ToolResult): string {
 
 // ---------- createServer + server wiring ----------
 
-test("createServer registers the 9 expected tools", () => {
+test("createServer registers the 11 expected tools", () => {
   const server = createServer({
     client: makeClientMock(),
     inferRepo: async () => ({ workspace: "ws", repo: "r" }),
@@ -114,6 +118,8 @@ test("createServer registers the 9 expected tools", () => {
       "list_pr_comments",
       "list_prs",
       "reply_to_pr_comment",
+      "resolve_pr_comment",
+      "update_pr",
     ].sort(),
   );
 });
@@ -413,6 +419,113 @@ test("add_pr_inline_comment defaults side to 'new'", async () => {
     throw new Error("expected call");
   }
   expect(call[1].side).toBe("new");
+});
+
+test("list_pr_comments surfaces resolved=true when resolution is set", async () => {
+  const resolved = sampleComment(1, "resolved one");
+  resolved.resolution = {
+    type: "pullrequest_comment_resolution",
+    user: { display_name: "Ada" },
+    created_on: "2024-01-02T00:00:00Z",
+  };
+  const unresolved = sampleComment(2, "open one");
+  unresolved.resolution = null;
+  const stillOpen = sampleComment(3, "no resolution key");
+  const client = makeClientMock({
+    listPrComments: vi.fn(async () => [resolved, unresolved, stillOpen]),
+  });
+  const deps = makeDeps({ client });
+
+  const result = await handleListPrComments(deps, { pr_id: 7 });
+  const parsed = JSON.parse(extractText(result));
+  // Sorted oldest-first by created_on; all share the same date here so order
+  // is stable as inserted. Index by id to be safe.
+  const byId = new Map<number, { resolved: boolean }>(
+    parsed.map((c: { id: number; resolved: boolean }) => [c.id, c]),
+  );
+  expect(byId.get(1)?.resolved).toBe(true);
+  expect(byId.get(2)?.resolved).toBe(false);
+  expect(byId.get(3)?.resolved).toBe(false);
+});
+
+test("update_pr requires at least one of title/description", async () => {
+  const updatePr = vi.fn();
+  const client = makeClientMock({ updatePr });
+  const deps = makeDeps({ client });
+
+  const result = await handleUpdatePr(deps, { pr_id: 7 });
+
+  expect(result.isError).toBe(true);
+  expect(extractText(result)).toContain("Pass at least one of `title` or `description`");
+  expect(updatePr).not.toHaveBeenCalled();
+});
+
+test("update_pr passes title and description through to client", async () => {
+  const pr = samplePr(7, "New title");
+  const updatePr = vi.fn(async () => pr);
+  const client = makeClientMock({ updatePr });
+  const deps = makeDeps({ client });
+
+  const result = await handleUpdatePr(deps, {
+    pr_id: 7,
+    title: "New title",
+    description: "Refreshed body",
+  });
+
+  expect(result.isError).toBeFalsy();
+  expect(updatePr).toHaveBeenCalledWith(
+    { workspace: "ws", repo: "r", prId: 7 },
+    { title: "New title", description: "Refreshed body" },
+  );
+  expect(extractText(result).startsWith("Updated PR #7")).toBe(true);
+});
+
+test("update_pr accepts description-only and forwards undefined title", async () => {
+  const pr = samplePr(7);
+  const updatePr = vi.fn(async () => pr);
+  const client = makeClientMock({ updatePr });
+  const deps = makeDeps({ client });
+
+  await handleUpdatePr(deps, { pr_id: 7, description: "Just the body" });
+
+  expect(updatePr).toHaveBeenCalledWith(
+    { workspace: "ws", repo: "r", prId: 7 },
+    { title: undefined, description: "Just the body" },
+  );
+});
+
+test("resolve_pr_comment defaults resolved=true and forwards id", async () => {
+  const resolvedComment = sampleComment(11, "lgtm");
+  resolvedComment.resolution = {
+    type: "pullrequest_comment_resolution",
+    user: { display_name: "Ada" },
+    created_on: "2024-01-02T00:00:00Z",
+  };
+  const resolvePrComment = vi.fn(async () => resolvedComment);
+  const client = makeClientMock({ resolvePrComment });
+  const deps = makeDeps({ client });
+
+  const result = await handleResolvePrComment(deps, { pr_id: 7, comment_id: 11 });
+
+  expect(result.isError).toBeFalsy();
+  expect(resolvePrComment).toHaveBeenCalledWith({ workspace: "ws", repo: "r", prId: 7 }, 11, true);
+  expect(extractText(result).startsWith("Marked comment #11 resolved")).toBe(true);
+});
+
+test("resolve_pr_comment with resolved=false sends through and reports unresolved", async () => {
+  const resolvePrComment = vi.fn(async () => undefined);
+  const client = makeClientMock({ resolvePrComment });
+  const deps = makeDeps({ client });
+
+  const result = await handleResolvePrComment(deps, {
+    pr_id: 7,
+    comment_id: 11,
+    resolved: false,
+  });
+
+  expect(result.isError).toBeFalsy();
+  expect(resolvePrComment).toHaveBeenCalledWith({ workspace: "ws", repo: "r", prId: 7 }, 11, false);
+  expect(extractText(result)).toBe("Marked comment #11 unresolved");
 });
 
 test("reply_to_pr_comment passes parent id through and reports it", async () => {

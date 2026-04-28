@@ -53,6 +53,12 @@ export type BitbucketComment = {
     to?: number | null;
   };
   parent?: { id: number };
+  // null when unresolved, object when resolved.
+  resolution?: {
+    type?: string;
+    user?: { display_name?: string; uuid?: string };
+    created_on?: string;
+  } | null;
 };
 
 export type BitbucketPipeline = {

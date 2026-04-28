@@ -63,7 +63,10 @@ function makeScriptedFetch(responses: Scripted[]): {
     }
     idx++;
     const resHeaders = new Headers(r.headers ?? {});
-    return new Response(r.body ?? "", {
+    // 204/304 responses must have a null body per the Response spec.
+    const noBodyStatus = r.status === 204 || r.status === 304;
+    const responseBody = noBodyStatus ? null : (r.body ?? "");
+    return new Response(responseBody, {
       status: r.status,
       headers: resHeaders,
     });
@@ -533,6 +536,111 @@ test('addPrInlineComment side="old" uses inline.from', async () => {
     content: { raw: "review" },
     inline: { path: "src/foo.ts", from: 5 },
   });
+});
+
+// ---------- updatePr ----------
+
+test("updatePr sends PUT with both title and description.raw", async () => {
+  const { fetch, calls } = makeScriptedFetch([
+    {
+      status: 200,
+      body: JSON.stringify({ ...SAMPLE_PR, title: "New title" }),
+    },
+  ]);
+  const client = new BitbucketClient({
+    getAccessToken: async () => "t",
+    fetch,
+  });
+  const updated = await client.updatePr(
+    { workspace: "ws", repo: "repo", prId: 42 },
+    { title: "New title", description: "New body" },
+  );
+  expect(updated.title).toBe("New title");
+  expect(calls[0]?.method).toBe("PUT");
+  expect(calls[0]?.url).toBe("https://api.bitbucket.org/2.0/repositories/ws/repo/pullrequests/42");
+  expect(calls[0]?.headers["content-type"]).toBe("application/json");
+  expect(JSON.parse(calls[0]?.body ?? "")).toEqual({
+    title: "New title",
+    description: { raw: "New body" },
+  });
+});
+
+test("updatePr with title only sends partial body (no description key)", async () => {
+  const { fetch, calls } = makeScriptedFetch([
+    {
+      status: 200,
+      body: JSON.stringify({ ...SAMPLE_PR, title: "Only title" }),
+    },
+  ]);
+  const client = new BitbucketClient({
+    getAccessToken: async () => "t",
+    fetch,
+  });
+  await client.updatePr({ workspace: "ws", repo: "repo", prId: 42 }, { title: "Only title" });
+  expect(JSON.parse(calls[0]?.body ?? "")).toEqual({ title: "Only title" });
+});
+
+test("updatePr with description only sends nested raw, no title key", async () => {
+  const { fetch, calls } = makeScriptedFetch([{ status: 200, body: JSON.stringify(SAMPLE_PR) }]);
+  const client = new BitbucketClient({
+    getAccessToken: async () => "t",
+    fetch,
+  });
+  await client.updatePr(
+    { workspace: "ws", repo: "repo", prId: 42 },
+    { description: "Just markdown" },
+  );
+  expect(JSON.parse(calls[0]?.body ?? "")).toEqual({
+    description: { raw: "Just markdown" },
+  });
+});
+
+// ---------- resolvePrComment ----------
+
+test("resolvePrComment(true) POSTs to /resolve and returns parsed body", async () => {
+  const { fetch, calls } = makeScriptedFetch([
+    {
+      status: 200,
+      body: JSON.stringify({
+        id: 5,
+        content: { raw: "lgtm" },
+        user: { display_name: "u", uuid: "x" },
+        created_on: "2026-04-20T00:00:00Z",
+        updated_on: "2026-04-20T00:00:00Z",
+        resolution: {
+          type: "pullrequest_comment_resolution",
+          user: { display_name: "u" },
+          created_on: "2026-04-20T00:01:00Z",
+        },
+      }),
+    },
+  ]);
+  const client = new BitbucketClient({
+    getAccessToken: async () => "t",
+    fetch,
+  });
+  const out = await client.resolvePrComment({ workspace: "ws", repo: "repo", prId: 42 }, 5, true);
+  expect(out?.id).toBe(5);
+  expect(out?.resolution).not.toBeNull();
+  expect(calls[0]?.method).toBe("POST");
+  expect(calls[0]?.url).toBe(
+    "https://api.bitbucket.org/2.0/repositories/ws/repo/pullrequests/42/comments/5/resolve",
+  );
+  expect(calls[0]?.body).toBeUndefined();
+});
+
+test("resolvePrComment(false) issues DELETE and returns undefined for 204", async () => {
+  const { fetch, calls } = makeScriptedFetch([{ status: 204, body: "" }]);
+  const client = new BitbucketClient({
+    getAccessToken: async () => "t",
+    fetch,
+  });
+  const out = await client.resolvePrComment({ workspace: "ws", repo: "repo", prId: 42 }, 5, false);
+  expect(out).toBeUndefined();
+  expect(calls[0]?.method).toBe("DELETE");
+  expect(calls[0]?.url).toBe(
+    "https://api.bitbucket.org/2.0/repositories/ws/repo/pullrequests/42/comments/5/resolve",
+  );
 });
 
 // ---------- getPrPipelineStatus ----------

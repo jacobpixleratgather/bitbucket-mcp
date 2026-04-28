@@ -5,3 +5,4 @@ dist
 .vite-hooks
 .claude/settings.local.json
 docs
+.gstack/

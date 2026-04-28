@@ -135,6 +135,42 @@ export class BitbucketClient {
     });
   }
 
+  async updatePr(
+    t: PrTarget,
+    args: { title?: string; description?: string },
+  ): Promise<BitbucketPr> {
+    const body: { title?: string; description?: { raw: string } } = {};
+    if (args.title !== undefined) {
+      body.title = args.title;
+    }
+    if (args.description !== undefined) {
+      body.description = { raw: args.description };
+    }
+    const url = `${BASE_URL}/repositories/${encode(t.workspace)}/${encode(
+      t.repo,
+    )}/pullrequests/${t.prId}`;
+    return await this.#requestJson<BitbucketPr>(url, {
+      method: "PUT",
+      json: body,
+    });
+  }
+
+  async resolvePrComment(
+    t: PrTarget,
+    commentId: number,
+    resolved: boolean,
+  ): Promise<BitbucketComment | undefined> {
+    const url = `${BASE_URL}/repositories/${encode(t.workspace)}/${encode(
+      t.repo,
+    )}/pullrequests/${t.prId}/comments/${commentId}/resolve`;
+    if (resolved) {
+      return await this.#requestJson<BitbucketComment>(url, { method: "POST" });
+    }
+    // DELETE returns 204 with no body.
+    await this.#requestJson<unknown>(url, { method: "DELETE" });
+    return undefined;
+  }
+
   async addPrInlineComment(
     t: PrTarget,
     args: { body: string; path: string; line: number; side?: "new" | "old" },
