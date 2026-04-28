@@ -52,7 +52,7 @@ vp pm publish          # runs prepublishOnly (check + test + build) then uploads
 
 `prepublishOnly` runs `vp check && vp test && vp run build` so a broken build never reaches the registry. 2FA is required on the npm account; the publish prompts for an OTP.
 
-We do not maintain a `CHANGELOG.md` — use GitHub Releases (auto-generated from PR titles) for the changelog. We do not currently sign npm provenance (would require GitHub Actions OIDC).
+Release notes live in [`CHANGELOG.md`](./CHANGELOG.md) — add an entry under a new `## [vX.Y.Z]` heading whenever you ship user-facing changes. We do not currently sign npm provenance (would require GitHub Actions OIDC).
 
 ## Source layout
 
