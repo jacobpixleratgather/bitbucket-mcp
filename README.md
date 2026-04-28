@@ -1,6 +1,6 @@
 # bitbucket-mcp
 
-A [Model Context Protocol](https://modelcontextprotocol.io) server for **Bitbucket Cloud**, optimized for use with [Claude Code](https://docs.claude.com/en/docs/claude-code/overview). Lets the agent read pull request diffs, read and write PR comments (including file + line inline comments), and read Bitbucket Pipelines step logs so it can debug failing builds.
+A [Model Context Protocol](https://modelcontextprotocol.io) server for **Bitbucket Cloud**, optimized for use with [Claude Code](https://docs.claude.com/en/docs/claude-code/overview). Lets the agent read pull request diffs, read and write PR comments (including file + line inline comments), edit the PR Overview (title and description), resolve and unresolve comment threads, and read Bitbucket Pipelines step logs so it can debug failing builds.
 
 **Status:** alpha. Distributed on npm as [`@mcpkits/bitbucket`](https://www.npmjs.com/package/@mcpkits/bitbucket).
 
