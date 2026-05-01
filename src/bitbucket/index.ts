@@ -139,12 +139,16 @@ export class BitbucketClient {
     t: PrTarget,
     args: { title?: string; description?: string },
   ): Promise<BitbucketPr> {
-    const body: { title?: string; description?: { raw: string } } = {};
+    // Bitbucket Cloud's PUT pullrequests endpoint expects `description` as a
+    // plain string, not the nested `{ raw }` shape used for comment content.
+    // Sending the nested form caused the literal object to be stored as the
+    // PR's description text. See BitbucketPr.description: string in types.ts.
+    const body: { title?: string; description?: string } = {};
     if (args.title !== undefined) {
       body.title = args.title;
     }
     if (args.description !== undefined) {
-      body.description = { raw: args.description };
+      body.description = args.description;
     }
     const url = `${BASE_URL}/repositories/${encode(t.workspace)}/${encode(
       t.repo,

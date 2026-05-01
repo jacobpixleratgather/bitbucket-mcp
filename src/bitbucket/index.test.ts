@@ -540,7 +540,7 @@ test('addPrInlineComment side="old" uses inline.from', async () => {
 
 // ---------- updatePr ----------
 
-test("updatePr sends PUT with both title and description.raw", async () => {
+test("updatePr sends PUT with both title and description as a plain string", async () => {
   const { fetch, calls } = makeScriptedFetch([
     {
       status: 200,
@@ -559,9 +559,12 @@ test("updatePr sends PUT with both title and description.raw", async () => {
   expect(calls[0]?.method).toBe("PUT");
   expect(calls[0]?.url).toBe("https://api.bitbucket.org/2.0/repositories/ws/repo/pullrequests/42");
   expect(calls[0]?.headers["content-type"]).toBe("application/json");
+  // Bitbucket Cloud's PR PUT endpoint expects `description` as a plain string.
+  // Sending the nested `{ raw }` shape (used by the comments API) caused the
+  // literal object to leak into the rendered PR description.
   expect(JSON.parse(calls[0]?.body ?? "")).toEqual({
     title: "New title",
-    description: { raw: "New body" },
+    description: "New body",
   });
 });
 
@@ -580,7 +583,7 @@ test("updatePr with title only sends partial body (no description key)", async (
   expect(JSON.parse(calls[0]?.body ?? "")).toEqual({ title: "Only title" });
 });
 
-test("updatePr with description only sends nested raw, no title key", async () => {
+test("updatePr with description only sends a plain string, no title key", async () => {
   const { fetch, calls } = makeScriptedFetch([{ status: 200, body: JSON.stringify(SAMPLE_PR) }]);
   const client = new BitbucketClient({
     getAccessToken: async () => "t",
@@ -591,8 +594,26 @@ test("updatePr with description only sends nested raw, no title key", async () =
     { description: "Just markdown" },
   );
   expect(JSON.parse(calls[0]?.body ?? "")).toEqual({
-    description: { raw: "Just markdown" },
+    description: "Just markdown",
   });
+});
+
+test("updatePr passes the description verbatim — never wraps it in { raw }", async () => {
+  // Regression: the previous implementation wrapped description as `{ raw }`,
+  // which Bitbucket Cloud rejects/serialises as the literal object. Guard the
+  // exact wire shape so this can't regress.
+  const { fetch, calls } = makeScriptedFetch([{ status: 200, body: JSON.stringify(SAMPLE_PR) }]);
+  const client = new BitbucketClient({
+    getAccessToken: async () => "t",
+    fetch,
+  });
+  await client.updatePr(
+    { workspace: "ws", repo: "repo", prId: 42 },
+    { description: "**bold** and a paragraph" },
+  );
+  const sentBody = JSON.parse(calls[0]?.body ?? "{}") as Record<string, unknown>;
+  expect(typeof sentBody.description).toBe("string");
+  expect(sentBody.description).toBe("**bold** and a paragraph");
 });
 
 // ---------- resolvePrComment ----------
