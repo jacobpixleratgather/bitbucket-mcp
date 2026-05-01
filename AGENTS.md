@@ -42,17 +42,18 @@ This repo uses [Vite+](https://viteplus.dev). The global `vp` CLI wraps Vite, Ro
 
 ## Release
 
-The package is published manually from a developer machine. Three commands:
+The package is published manually from a developer machine:
 
 ```bash
-pnpm exec bumpp        # interactive: pick patch/minor/major; commits + tags
-git push --follow-tags # if bumpp didn't push for you
-vp pm publish          # runs prepublishOnly (check + test + build) then uploads
+pnpm exec bumpp                    # interactive: pick patch/minor/major; commits + tags
+git push --follow-tags             # if bumpp didn't push for you
+gh release create vX.Y.Z --notes…  # publish notes against the tag
+vp pm publish                      # runs prepublishOnly (check + test + build) then uploads
 ```
 
 `prepublishOnly` runs `vp check && vp test && vp run build` so a broken build never reaches the registry. 2FA is required on the npm account; the publish prompts for an OTP.
 
-Release notes live in [`CHANGELOG.md`](./CHANGELOG.md) — add an entry under a new `## [vX.Y.Z]` heading whenever you ship user-facing changes. We do not currently sign npm provenance (would require GitHub Actions OIDC).
+Release notes live as **GitHub Releases attached to the version tag** — write a short summary (one paragraph or a few bullets) covering what changed for users when you cut a release. We do not currently sign npm provenance (would require GitHub Actions OIDC).
 
 ## Source layout
 
