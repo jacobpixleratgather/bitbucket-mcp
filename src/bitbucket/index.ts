@@ -135,6 +135,47 @@ export class BitbucketClient {
     });
   }
 
+  async createPr(
+    t: RepoTarget,
+    args: {
+      title: string;
+      sourceBranch: string;
+      destinationBranch?: string;
+      description?: string;
+      closeSourceBranch?: boolean;
+      reviewers?: string[];
+    },
+  ): Promise<BitbucketPr> {
+    const body: {
+      title: string;
+      source: { branch: { name: string } };
+      destination?: { branch: { name: string } };
+      description?: string;
+      close_source_branch?: boolean;
+      reviewers?: Array<{ uuid: string }>;
+    } = {
+      title: args.title,
+      source: { branch: { name: args.sourceBranch } },
+    };
+    if (args.destinationBranch !== undefined) {
+      body.destination = { branch: { name: args.destinationBranch } };
+    }
+    if (args.description !== undefined) {
+      body.description = args.description;
+    }
+    if (args.closeSourceBranch !== undefined) {
+      body.close_source_branch = args.closeSourceBranch;
+    }
+    if (args.reviewers !== undefined && args.reviewers.length > 0) {
+      body.reviewers = args.reviewers.map((uuid) => ({ uuid }));
+    }
+    const url = `${BASE_URL}/repositories/${encode(t.workspace)}/${encode(t.repo)}/pullrequests`;
+    return await this.#requestJson<BitbucketPr>(url, {
+      method: "POST",
+      json: body,
+    });
+  }
+
   async updatePr(
     t: PrTarget,
     args: { title?: string; description?: string },
@@ -156,6 +197,19 @@ export class BitbucketClient {
     return await this.#requestJson<BitbucketPr>(url, {
       method: "PUT",
       json: body,
+    });
+  }
+
+  async setPrDraftState(t: PrTarget, draft: boolean): Promise<BitbucketPr> {
+    // Bitbucket Cloud accepts a partial PUT with just `draft` set; the
+    // server preserves all other fields. Sending it bare keeps this
+    // separate from `updatePr`'s title/description path.
+    const url = `${BASE_URL}/repositories/${encode(t.workspace)}/${encode(
+      t.repo,
+    )}/pullrequests/${t.prId}`;
+    return await this.#requestJson<BitbucketPr>(url, {
+      method: "PUT",
+      json: { draft },
     });
   }
 

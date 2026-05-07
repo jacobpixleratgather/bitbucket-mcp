@@ -358,6 +358,21 @@ export async function handleUpdatePr(
   });
 }
 
+export async function handleSetPrDraftState(
+  deps: HandlerDeps,
+  args: { workspace?: string; repo?: string; pr_id?: number; draft: boolean },
+): Promise<ToolResult> {
+  return safely(async () => {
+    const repo = await resolveRepo(deps, args);
+    if (repo === null) return errorResult(NO_REPO_MESSAGE);
+    const resolved = await resolvePrTarget(deps, repo, args.pr_id);
+    if (!resolved.ok) return errorResult(resolved.error);
+    const updated = await deps.client.setPrDraftState(resolved.target, args.draft);
+    const verb = args.draft ? "draft" : "ready for review";
+    return textResult(`Marked PR #${updated.id} as ${verb}\n${JSON.stringify(updated, null, 2)}`);
+  });
+}
+
 export async function handleResolvePrComment(
   deps: HandlerDeps,
   args: {
@@ -378,6 +393,44 @@ export async function handleResolvePrComment(
     const verb = wantResolved ? "resolved" : "unresolved";
     const tail = out !== undefined ? `\n${JSON.stringify(out, null, 2)}` : "";
     return textResult(`Marked comment #${args.comment_id} ${verb}${tail}`);
+  });
+}
+
+export async function handleCreatePr(
+  deps: HandlerDeps,
+  args: {
+    workspace?: string;
+    repo?: string;
+    title: string;
+    source_branch?: string;
+    destination_branch?: string;
+    description?: string;
+    close_source_branch?: boolean;
+    reviewers?: string[];
+  },
+): Promise<ToolResult> {
+  return safely(async () => {
+    const repo = await resolveRepo(deps, args);
+    if (repo === null) return errorResult(NO_REPO_MESSAGE);
+    let sourceBranch = args.source_branch;
+    if (sourceBranch === undefined) {
+      const branch = await deps.getBranch(deps.cwd);
+      if (branch === null) {
+        return errorResult(
+          "Could not determine current git branch to use as the PR source. Pass `source_branch` explicitly.",
+        );
+      }
+      sourceBranch = branch;
+    }
+    const created = await deps.client.createPr(repo, {
+      title: args.title,
+      sourceBranch,
+      destinationBranch: args.destination_branch,
+      description: args.description,
+      closeSourceBranch: args.close_source_branch,
+      reviewers: args.reviewers,
+    });
+    return textResult(`Created PR #${created.id}\n${JSON.stringify(created, null, 2)}`);
   });
 }
 
@@ -591,6 +644,28 @@ function registerTools(server: McpServer, deps: HandlerDeps): void {
   );
 
   server.registerTool(
+    "set_pr_draft_state",
+    {
+      title: "Set PR draft state",
+      description:
+        "Mark a pull request as draft or ready for review. Pass `draft: true` to convert to draft, or `draft: false` to mark ready.",
+      inputSchema: {
+        ...workspaceRepoShape,
+        ...prIdShape,
+        draft: z.boolean().describe("True to mark as draft, false to mark ready for review."),
+      },
+      annotations: {
+        title: "Set PR draft state",
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
+      },
+    },
+    async (args) => handleSetPrDraftState(deps, args),
+  );
+
+  server.registerTool(
     "resolve_pr_comment",
     {
       title: "Resolve PR comment",
@@ -614,6 +689,40 @@ function registerTools(server: McpServer, deps: HandlerDeps): void {
       },
     },
     async (args) => handleResolvePrComment(deps, args),
+  );
+
+  server.registerTool(
+    "create_pr",
+    {
+      title: "Create PR",
+      description:
+        "Open a new pull request. `source_branch` defaults to the current git branch when run from inside a checkout. `destination_branch` defaults to the repository's configured main branch on Bitbucket. `description` is interpreted as Markdown. `reviewers` is a list of Bitbucket account UUIDs (including the curly braces).",
+      inputSchema: {
+        ...workspaceRepoShape,
+        title: z.string().min(1).describe("PR title."),
+        source_branch: z
+          .string()
+          .min(1)
+          .optional()
+          .describe("Source branch name. Defaults to the current git branch."),
+        destination_branch: z
+          .string()
+          .min(1)
+          .optional()
+          .describe("Destination branch name. Defaults to the repo's main branch."),
+        description: z.string().optional().describe("PR description (Markdown)."),
+        close_source_branch: z
+          .boolean()
+          .optional()
+          .describe("If true, the source branch is deleted on merge."),
+        reviewers: z
+          .array(z.string().min(1))
+          .optional()
+          .describe("Reviewer account UUIDs (e.g. `{abcd-...}`)."),
+      },
+      annotations: { title: "Create PR", ...WRITE },
+    },
+    async (args) => handleCreatePr(deps, args),
   );
 
   server.registerTool(

@@ -538,6 +538,86 @@ test('addPrInlineComment side="old" uses inline.from', async () => {
   });
 });
 
+// ---------- createPr ----------
+
+test("createPr POSTs minimal body with source branch only", async () => {
+  const { fetch, calls } = makeScriptedFetch([
+    { status: 201, body: JSON.stringify({ ...SAMPLE_PR, id: 99, title: "New PR" }) },
+  ]);
+  const client = new BitbucketClient({
+    getAccessToken: async () => "t",
+    fetch,
+  });
+  const created = await client.createPr(
+    { workspace: "ws", repo: "repo" },
+    { title: "New PR", sourceBranch: "feature/x" },
+  );
+  expect(created.id).toBe(99);
+  expect(calls[0]?.method).toBe("POST");
+  expect(calls[0]?.url).toBe("https://api.bitbucket.org/2.0/repositories/ws/repo/pullrequests");
+  expect(calls[0]?.headers["content-type"]).toBe("application/json");
+  expect(JSON.parse(calls[0]?.body ?? "")).toEqual({
+    title: "New PR",
+    source: { branch: { name: "feature/x" } },
+  });
+});
+
+test("createPr forwards destination, description, close_source_branch, reviewers", async () => {
+  const { fetch, calls } = makeScriptedFetch([{ status: 201, body: JSON.stringify(SAMPLE_PR) }]);
+  const client = new BitbucketClient({
+    getAccessToken: async () => "t",
+    fetch,
+  });
+  await client.createPr(
+    { workspace: "ws", repo: "repo" },
+    {
+      title: "Add feature",
+      sourceBranch: "feature/x",
+      destinationBranch: "develop",
+      description: "**why**",
+      closeSourceBranch: true,
+      reviewers: ["{uuid-a}", "{uuid-b}"],
+    },
+  );
+  expect(JSON.parse(calls[0]?.body ?? "")).toEqual({
+    title: "Add feature",
+    source: { branch: { name: "feature/x" } },
+    destination: { branch: { name: "develop" } },
+    description: "**why**",
+    close_source_branch: true,
+    reviewers: [{ uuid: "{uuid-a}" }, { uuid: "{uuid-b}" }],
+  });
+});
+
+test("createPr passes description as a plain string, never wrapped in { raw }", async () => {
+  const { fetch, calls } = makeScriptedFetch([{ status: 201, body: JSON.stringify(SAMPLE_PR) }]);
+  const client = new BitbucketClient({
+    getAccessToken: async () => "t",
+    fetch,
+  });
+  await client.createPr(
+    { workspace: "ws", repo: "repo" },
+    { title: "T", sourceBranch: "feature/x", description: "**bold** body" },
+  );
+  const sent = JSON.parse(calls[0]?.body ?? "{}") as Record<string, unknown>;
+  expect(typeof sent.description).toBe("string");
+  expect(sent.description).toBe("**bold** body");
+});
+
+test("createPr with empty reviewers array omits the reviewers key", async () => {
+  const { fetch, calls } = makeScriptedFetch([{ status: 201, body: JSON.stringify(SAMPLE_PR) }]);
+  const client = new BitbucketClient({
+    getAccessToken: async () => "t",
+    fetch,
+  });
+  await client.createPr(
+    { workspace: "ws", repo: "repo" },
+    { title: "T", sourceBranch: "feature/x", reviewers: [] },
+  );
+  const sent = JSON.parse(calls[0]?.body ?? "{}") as Record<string, unknown>;
+  expect(sent).not.toHaveProperty("reviewers");
+});
+
 // ---------- updatePr ----------
 
 test("updatePr sends PUT with both title and description as a plain string", async () => {
@@ -614,6 +694,34 @@ test("updatePr passes the description verbatim — never wraps it in { raw }", a
   const sentBody = JSON.parse(calls[0]?.body ?? "{}") as Record<string, unknown>;
   expect(typeof sentBody.description).toBe("string");
   expect(sentBody.description).toBe("**bold** and a paragraph");
+});
+
+// ---------- setPrDraftState ----------
+
+test("setPrDraftState(true) PUTs { draft: true } and nothing else", async () => {
+  const { fetch, calls } = makeScriptedFetch([
+    { status: 200, body: JSON.stringify({ ...SAMPLE_PR }) },
+  ]);
+  const client = new BitbucketClient({
+    getAccessToken: async () => "t",
+    fetch,
+  });
+  await client.setPrDraftState({ workspace: "ws", repo: "repo", prId: 42 }, true);
+  expect(calls[0]?.method).toBe("PUT");
+  expect(calls[0]?.url).toBe("https://api.bitbucket.org/2.0/repositories/ws/repo/pullrequests/42");
+  expect(JSON.parse(calls[0]?.body ?? "")).toEqual({ draft: true });
+});
+
+test("setPrDraftState(false) PUTs { draft: false }", async () => {
+  const { fetch, calls } = makeScriptedFetch([
+    { status: 200, body: JSON.stringify({ ...SAMPLE_PR }) },
+  ]);
+  const client = new BitbucketClient({
+    getAccessToken: async () => "t",
+    fetch,
+  });
+  await client.setPrDraftState({ workspace: "ws", repo: "repo", prId: 42 }, false);
+  expect(JSON.parse(calls[0]?.body ?? "")).toEqual({ draft: false });
 });
 
 // ---------- resolvePrComment ----------

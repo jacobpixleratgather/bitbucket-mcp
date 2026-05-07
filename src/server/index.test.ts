@@ -14,6 +14,7 @@ import {
   createServer,
   handleAddPrComment,
   handleAddPrInlineComment,
+  handleCreatePr,
   handleGetPipelineStepLog,
   handleGetPr,
   handleGetPrDiff,
@@ -22,6 +23,7 @@ import {
   handleListPrs,
   handleReplyToPrComment,
   handleResolvePrComment,
+  handleSetPrDraftState,
   handleUpdatePr,
   type HandlerDeps,
   type ToolResult,
@@ -37,10 +39,12 @@ function makeClientMock(overrides: Partial<BitbucketClient> = {}): BitbucketClie
     listPrComments: vi.fn(),
     addPrComment: vi.fn(),
     addPrInlineComment: vi.fn(),
+    createPr: vi.fn(),
     getPrPipelineStatus: vi.fn(),
     getPipelineStepLog: vi.fn(),
     replyToPrComment: vi.fn(),
     updatePr: vi.fn(),
+    setPrDraftState: vi.fn(),
     resolvePrComment: vi.fn(),
   };
   return Object.assign(base, overrides) as unknown as BitbucketClient;
@@ -96,7 +100,7 @@ function extractText(result: ToolResult): string {
 
 // ---------- createServer + server wiring ----------
 
-test("createServer registers the 11 expected tools", () => {
+test("createServer registers the 13 expected tools", () => {
   const server = createServer({
     client: makeClientMock(),
     inferRepo: async () => ({ workspace: "ws", repo: "r" }),
@@ -111,6 +115,7 @@ test("createServer registers the 11 expected tools", () => {
     [
       "add_pr_comment",
       "add_pr_inline_comment",
+      "create_pr",
       "get_pipeline_step_log",
       "get_pr",
       "get_pr_diff",
@@ -119,6 +124,7 @@ test("createServer registers the 11 expected tools", () => {
       "list_prs",
       "reply_to_pr_comment",
       "resolve_pr_comment",
+      "set_pr_draft_state",
       "update_pr",
     ].sort(),
   );
@@ -494,6 +500,43 @@ test("update_pr accepts description-only and forwards undefined title", async ()
   );
 });
 
+test("set_pr_draft_state(true) reports 'draft' and forwards args", async () => {
+  const updated = samplePr(7, "Hello");
+  const setPrDraftState = vi.fn(async () => updated);
+  const client = makeClientMock({ setPrDraftState });
+  const deps = makeDeps({ client });
+
+  const result = await handleSetPrDraftState(deps, { pr_id: 7, draft: true });
+
+  expect(result.isError).toBeFalsy();
+  expect(setPrDraftState).toHaveBeenCalledWith({ workspace: "ws", repo: "r", prId: 7 }, true);
+  expect(extractText(result).startsWith("Marked PR #7 as draft")).toBe(true);
+});
+
+test("set_pr_draft_state(false) reports 'ready for review'", async () => {
+  const updated = samplePr(7, "Hello");
+  const setPrDraftState = vi.fn(async () => updated);
+  const client = makeClientMock({ setPrDraftState });
+  const deps = makeDeps({ client });
+
+  const result = await handleSetPrDraftState(deps, { pr_id: 7, draft: false });
+
+  expect(result.isError).toBeFalsy();
+  expect(setPrDraftState).toHaveBeenCalledWith({ workspace: "ws", repo: "r", prId: 7 }, false);
+  expect(extractText(result).startsWith("Marked PR #7 as ready for review")).toBe(true);
+});
+
+test("set_pr_draft_state infers pr_id from current branch", async () => {
+  const setPrDraftState = vi.fn(async () => samplePr(99));
+  const listPrs = vi.fn(async () => [samplePr(99)]);
+  const client = makeClientMock({ setPrDraftState, listPrs });
+  const deps = makeDeps({ client, getBranch: vi.fn(async () => "feature/x") });
+
+  await handleSetPrDraftState(deps, { draft: true });
+
+  expect(setPrDraftState).toHaveBeenCalledWith({ workspace: "ws", repo: "r", prId: 99 }, true);
+});
+
 test("resolve_pr_comment defaults resolved=true and forwards id", async () => {
   const resolvedComment = sampleComment(11, "lgtm");
   resolvedComment.resolution = {
@@ -548,6 +591,79 @@ test("reply_to_pr_comment passes parent id through and reports it", async () => 
     "thanks",
   );
   expect(extractText(result).startsWith("Posted reply #77 to comment #17")).toBe(true);
+});
+
+// ---------- create_pr ----------
+
+test("create_pr defaults source_branch to current git branch and forwards args", async () => {
+  const created = samplePr(101, "Add feature");
+  const createPr = vi.fn(async () => created);
+  const client = makeClientMock({ createPr });
+  const deps = makeDeps({ client, getBranch: vi.fn(async () => "feature/x") });
+
+  const result = await handleCreatePr(deps, {
+    title: "Add feature",
+    description: "**why**",
+    destination_branch: "develop",
+    close_source_branch: true,
+    reviewers: ["{uuid-a}"],
+  });
+
+  expect(result.isError).toBeFalsy();
+  expect(createPr).toHaveBeenCalledWith(
+    { workspace: "ws", repo: "r" },
+    {
+      title: "Add feature",
+      sourceBranch: "feature/x",
+      destinationBranch: "develop",
+      description: "**why**",
+      closeSourceBranch: true,
+      reviewers: ["{uuid-a}"],
+    },
+  );
+  expect(extractText(result).startsWith("Created PR #101")).toBe(true);
+});
+
+test("create_pr explicit source_branch overrides current branch", async () => {
+  const createPr = vi.fn(async () => samplePr(102));
+  const client = makeClientMock({ createPr });
+  const getBranch = vi.fn(async () => "feature/x");
+  const deps = makeDeps({ client, getBranch });
+
+  await handleCreatePr(deps, {
+    title: "T",
+    source_branch: "explicit/branch",
+  });
+
+  expect(getBranch).not.toHaveBeenCalled();
+  expect(createPr).toHaveBeenCalledWith(
+    { workspace: "ws", repo: "r" },
+    { title: "T", sourceBranch: "explicit/branch" },
+  );
+});
+
+test("create_pr with no source_branch and detached HEAD returns actionable error", async () => {
+  const createPr = vi.fn();
+  const client = makeClientMock({ createPr });
+  const deps = makeDeps({ client, getBranch: vi.fn(async () => null) });
+
+  const result = await handleCreatePr(deps, { title: "T" });
+
+  expect(result.isError).toBe(true);
+  expect(extractText(result)).toContain("source_branch");
+  expect(createPr).not.toHaveBeenCalled();
+});
+
+test("create_pr surfaces no-repo error when inference fails", async () => {
+  const createPr = vi.fn();
+  const client = makeClientMock({ createPr });
+  const deps = makeDeps({ client, inferRepo: vi.fn(async () => null) });
+
+  const result = await handleCreatePr(deps, { title: "T", source_branch: "feature/x" });
+
+  expect(result.isError).toBe(true);
+  expect(extractText(result)).toContain("Could not determine workspace/repo");
+  expect(createPr).not.toHaveBeenCalled();
 });
 
 // ---------- Error handling ----------
