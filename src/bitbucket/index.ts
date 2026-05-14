@@ -178,18 +178,29 @@ export class BitbucketClient {
 
   async updatePr(
     t: PrTarget,
-    args: { title?: string; description?: string },
+    args: { title?: string; description?: string; reviewers?: string[] },
   ): Promise<BitbucketPr> {
     // Bitbucket Cloud's PUT pullrequests endpoint expects `description` as a
     // plain string, not the nested `{ raw }` shape used for comment content.
     // Sending the nested form caused the literal object to be stored as the
     // PR's description text. See BitbucketPr.description: string in types.ts.
-    const body: { title?: string; description?: string } = {};
+    //
+    // `reviewers` replaces the entire reviewers list on the PR — pass an
+    // empty array to clear all reviewers. Omit the field to leave it
+    // unchanged.
+    const body: {
+      title?: string;
+      description?: string;
+      reviewers?: Array<{ uuid: string }>;
+    } = {};
     if (args.title !== undefined) {
       body.title = args.title;
     }
     if (args.description !== undefined) {
       body.description = args.description;
+    }
+    if (args.reviewers !== undefined) {
+      body.reviewers = args.reviewers.map((uuid) => ({ uuid }));
     }
     const url = `${BASE_URL}/repositories/${encode(t.workspace)}/${encode(
       t.repo,

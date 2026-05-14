@@ -25,7 +25,7 @@ Write:
 | `add_pr_inline_comment` | Post a comment on a specific file + line in a PR's diff.             |
 | `reply_to_pr_comment`   | Post a threaded reply to an existing PR comment (general or inline). |
 | `create_pr`             | Open a new PR. Defaults source to the current git branch.            |
-| `update_pr`             | Update a PR's title and/or description (the PR Overview).            |
+| `update_pr`             | Update a PR's title, description (Overview), and/or reviewers list.  |
 | `set_pr_draft_state`    | Mark a PR as draft or ready for review.                              |
 | `resolve_pr_comment`    | Mark a PR comment resolved or unresolved.                            |
 

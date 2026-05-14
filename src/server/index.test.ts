@@ -454,7 +454,7 @@ test("list_pr_comments surfaces resolved=true when resolution is set", async () 
   expect(byId.get(3)?.resolved).toBe(false);
 });
 
-test("update_pr requires at least one of title/description", async () => {
+test("update_pr requires at least one of title/description/reviewers", async () => {
   const updatePr = vi.fn();
   const client = makeClientMock({ updatePr });
   const deps = makeDeps({ client });
@@ -462,7 +462,9 @@ test("update_pr requires at least one of title/description", async () => {
   const result = await handleUpdatePr(deps, { pr_id: 7 });
 
   expect(result.isError).toBe(true);
-  expect(extractText(result)).toContain("Pass at least one of `title` or `description`");
+  expect(extractText(result)).toContain(
+    "Pass at least one of `title`, `description`, or `reviewers`",
+  );
   expect(updatePr).not.toHaveBeenCalled();
 });
 
@@ -481,7 +483,7 @@ test("update_pr passes title and description through to client", async () => {
   expect(result.isError).toBeFalsy();
   expect(updatePr).toHaveBeenCalledWith(
     { workspace: "ws", repo: "r", prId: 7 },
-    { title: "New title", description: "Refreshed body" },
+    { title: "New title", description: "Refreshed body", reviewers: undefined },
   );
   expect(extractText(result).startsWith("Updated PR #7")).toBe(true);
 });
@@ -496,7 +498,38 @@ test("update_pr accepts description-only and forwards undefined title", async ()
 
   expect(updatePr).toHaveBeenCalledWith(
     { workspace: "ws", repo: "r", prId: 7 },
-    { title: undefined, description: "Just the body" },
+    { title: undefined, description: "Just the body", reviewers: undefined },
+  );
+});
+
+test("update_pr forwards reviewers (UUIDs) to the client", async () => {
+  const pr = samplePr(7);
+  const updatePr = vi.fn(async () => pr);
+  const client = makeClientMock({ updatePr });
+  const deps = makeDeps({ client });
+
+  await handleUpdatePr(deps, { pr_id: 7, reviewers: ["{abc}", "{def}"] });
+
+  expect(updatePr).toHaveBeenCalledWith(
+    { workspace: "ws", repo: "r", prId: 7 },
+    { title: undefined, description: undefined, reviewers: ["{abc}", "{def}"] },
+  );
+});
+
+test("update_pr accepts an empty reviewers array (clear all)", async () => {
+  // Empty array is a valid update — it clears all reviewers. The handler must
+  // forward it through (not treat it as "no update specified").
+  const pr = samplePr(7);
+  const updatePr = vi.fn(async () => pr);
+  const client = makeClientMock({ updatePr });
+  const deps = makeDeps({ client });
+
+  const result = await handleUpdatePr(deps, { pr_id: 7, reviewers: [] });
+
+  expect(result.isError).toBeFalsy();
+  expect(updatePr).toHaveBeenCalledWith(
+    { workspace: "ws", repo: "r", prId: 7 },
+    { title: undefined, description: undefined, reviewers: [] },
   );
 });
 

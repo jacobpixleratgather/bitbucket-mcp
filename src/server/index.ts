@@ -340,11 +340,16 @@ export async function handleUpdatePr(
     pr_id?: number;
     title?: string;
     description?: string;
+    reviewers?: string[];
   },
 ): Promise<ToolResult> {
   return safely(async () => {
-    if (args.title === undefined && args.description === undefined) {
-      return errorResult("Pass at least one of `title` or `description` to update.");
+    if (
+      args.title === undefined &&
+      args.description === undefined &&
+      args.reviewers === undefined
+    ) {
+      return errorResult("Pass at least one of `title`, `description`, or `reviewers` to update.");
     }
     const repo = await resolveRepo(deps, args);
     if (repo === null) return errorResult(NO_REPO_MESSAGE);
@@ -353,6 +358,7 @@ export async function handleUpdatePr(
     const updated = await deps.client.updatePr(resolved.target, {
       title: args.title,
       description: args.description,
+      reviewers: args.reviewers,
     });
     return textResult(`Updated PR #${updated.id}\n${JSON.stringify(updated, null, 2)}`);
   });
@@ -628,7 +634,7 @@ function registerTools(server: McpServer, deps: HandlerDeps): void {
     {
       title: "Update PR",
       description:
-        "Update a pull request's title and/or description (the PR Overview). Pass either or both — fields you omit are left unchanged. The description is interpreted as Markdown.",
+        "Update a pull request's title, description (the PR Overview), and/or reviewers. Pass any combination — fields you omit are left unchanged. The description is interpreted as Markdown. `reviewers` replaces the full reviewer list with the given Bitbucket account UUIDs (including the curly braces); pass an empty array to clear all reviewers.",
       inputSchema: {
         ...workspaceRepoShape,
         ...prIdShape,
@@ -637,6 +643,12 @@ function registerTools(server: McpServer, deps: HandlerDeps): void {
           .string()
           .optional()
           .describe("New PR description (Markdown). Pass an empty string to clear it."),
+        reviewers: z
+          .array(z.string().min(1))
+          .optional()
+          .describe(
+            "Reviewer account UUIDs (e.g. `{abcd-...}`). Replaces the entire reviewer list. Pass `[]` to clear all reviewers.",
+          ),
       },
       annotations: { title: "Update PR", ...WRITE },
     },

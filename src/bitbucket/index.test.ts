@@ -696,6 +696,50 @@ test("updatePr passes the description verbatim — never wraps it in { raw }", a
   expect(sentBody.description).toBe("**bold** and a paragraph");
 });
 
+test("updatePr with reviewers maps UUIDs to { uuid } objects", async () => {
+  const { fetch, calls } = makeScriptedFetch([{ status: 200, body: JSON.stringify(SAMPLE_PR) }]);
+  const client = new BitbucketClient({
+    getAccessToken: async () => "t",
+    fetch,
+  });
+  await client.updatePr(
+    { workspace: "ws", repo: "repo", prId: 42 },
+    { reviewers: ["{abc-123}", "{def-456}"] },
+  );
+  expect(JSON.parse(calls[0]?.body ?? "")).toEqual({
+    reviewers: [{ uuid: "{abc-123}" }, { uuid: "{def-456}" }],
+  });
+});
+
+test("updatePr with an empty reviewers array still sends [] (clear all)", async () => {
+  // Passing an empty array is the documented way to clear reviewers.
+  // Distinct from omitting the field, which leaves them unchanged.
+  const { fetch, calls } = makeScriptedFetch([{ status: 200, body: JSON.stringify(SAMPLE_PR) }]);
+  const client = new BitbucketClient({
+    getAccessToken: async () => "t",
+    fetch,
+  });
+  await client.updatePr({ workspace: "ws", repo: "repo", prId: 42 }, { reviewers: [] });
+  expect(JSON.parse(calls[0]?.body ?? "")).toEqual({ reviewers: [] });
+});
+
+test("updatePr combines title, description, and reviewers in one PUT", async () => {
+  const { fetch, calls } = makeScriptedFetch([{ status: 200, body: JSON.stringify(SAMPLE_PR) }]);
+  const client = new BitbucketClient({
+    getAccessToken: async () => "t",
+    fetch,
+  });
+  await client.updatePr(
+    { workspace: "ws", repo: "repo", prId: 42 },
+    { title: "T", description: "D", reviewers: ["{u}"] },
+  );
+  expect(JSON.parse(calls[0]?.body ?? "")).toEqual({
+    title: "T",
+    description: "D",
+    reviewers: [{ uuid: "{u}" }],
+  });
+});
+
 // ---------- setPrDraftState ----------
 
 test("setPrDraftState(true) PUTs { draft: true } and nothing else", async () => {
