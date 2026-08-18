@@ -7,6 +7,7 @@ import {
   type BitbucketPipeline,
   type BitbucketPr,
   type BitbucketStep,
+  type PipelineLookup,
   type PrTarget,
   type RepoTarget,
 } from "../types.ts";
@@ -15,14 +16,16 @@ import {
   handleAddPrComment,
   handleAddPrInlineComment,
   handleCreatePr,
+  handleGetBuildStatus,
   handleGetPipelineStepLog,
   handleGetPr,
   handleGetPrDiff,
-  handleGetPrPipelineStatus,
+  handleListPipelines,
   handleListPrComments,
   handleListPrs,
   handleReplyToPrComment,
   handleResolvePrComment,
+  handleRunPipeline,
   handleSetPrDraftState,
   handleUpdatePr,
   type HandlerDeps,
@@ -36,11 +39,19 @@ function makeClientMock(overrides: Partial<BitbucketClient> = {}): BitbucketClie
     getPr: vi.fn(),
     listPrs: vi.fn(),
     getPrDiff: vi.fn(),
+    getPrDiffStat: vi.fn(),
     listPrComments: vi.fn(),
     addPrComment: vi.fn(),
     addPrInlineComment: vi.fn(),
     createPr: vi.fn(),
-    getPrPipelineStatus: vi.fn(),
+    listPipelines: vi.fn(),
+    getPipeline: vi.fn(),
+    listPipelineSteps: vi.fn(),
+    findPipelinesForPr: vi.fn(),
+    findPipelinesForCommit: vi.fn(),
+    triggerPipeline: vi.fn(),
+    getCommitStatuses: vi.fn(),
+    getPrStatuses: vi.fn(),
     getPipelineStepLog: vi.fn(),
     replyToPrComment: vi.fn(),
     updatePr: vi.fn(),
@@ -55,6 +66,7 @@ function makeDeps(
     client?: BitbucketClient;
     inferRepo?: () => Promise<RepoTarget | null>;
     getBranch?: () => Promise<string | null>;
+    getHeadSha?: () => Promise<string | null>;
     cwd?: string;
   } = {},
 ): HandlerDeps {
@@ -62,6 +74,7 @@ function makeDeps(
     client: opts.client ?? makeClientMock(),
     inferRepo: opts.inferRepo ?? vi.fn(async () => ({ workspace: "ws", repo: "r" })),
     getBranch: opts.getBranch ?? vi.fn(async () => "feature/x"),
+    getHeadSha: opts.getHeadSha ?? vi.fn(async () => "a".repeat(40)),
     cwd: opts.cwd ?? "/tmp",
   };
 }
@@ -100,7 +113,7 @@ function extractText(result: ToolResult): string {
 
 // ---------- createServer + server wiring ----------
 
-test("createServer registers the 13 expected tools", () => {
+test("createServer registers the 15 expected tools", () => {
   const server = createServer({
     client: makeClientMock(),
     inferRepo: async () => ({ workspace: "ws", repo: "r" }),
@@ -116,14 +129,16 @@ test("createServer registers the 13 expected tools", () => {
       "add_pr_comment",
       "add_pr_inline_comment",
       "create_pr",
+      "get_build_status",
       "get_pipeline_step_log",
       "get_pr",
       "get_pr_diff",
-      "get_pr_pipeline_status",
+      "list_pipelines",
       "list_pr_comments",
       "list_prs",
       "reply_to_pr_comment",
       "resolve_pr_comment",
+      "run_pipeline",
       "set_pr_draft_state",
       "update_pr",
     ].sort(),
@@ -278,13 +293,75 @@ test("list_prs builds right client call and returns stripped shape", async () =>
 
 test("get_pr_diff returns diff text verbatim", async () => {
   const diff = "diff --git a/foo b/foo\n--- a/foo\n+++ b/foo\n@@ -1 +1 @@\n-x\n+y\n";
-  const client = makeClientMock({ getPrDiff: vi.fn(async () => diff) });
+  const getPrDiff = vi.fn(async () => diff);
+  const client = makeClientMock({ getPrDiff });
   const deps = makeDeps({ client });
 
   const result = await handleGetPrDiff(deps, { pr_id: 7 });
 
   expect(result.isError).toBeFalsy();
   expect(extractText(result)).toBe(diff);
+  expect(getPrDiff).toHaveBeenCalledWith(
+    { workspace: "ws", repo: "r", prId: 7 },
+    { paths: undefined },
+  );
+});
+
+test("get_pr_diff passes paths through to the client", async () => {
+  const getPrDiff = vi.fn(async () => "diff --git a/src/a.ts b/src/a.ts\n+x\n");
+  const deps = makeDeps({ client: makeClientMock({ getPrDiff }) });
+
+  await handleGetPrDiff(deps, { pr_id: 7, paths: ["src"] });
+
+  expect(getPrDiff).toHaveBeenCalledWith(
+    { workspace: "ws", repo: "r", prId: 7 },
+    { paths: ["src"] },
+  );
+});
+
+test("get_pr_diff truncates a huge diff with instructions instead of dumping it", async () => {
+  const diff = "x".repeat(5000);
+  const deps = makeDeps({ client: makeClientMock({ getPrDiff: vi.fn(async () => diff) }) });
+
+  const text = extractText(await handleGetPrDiff(deps, { pr_id: 7, max_bytes: 1000 }));
+
+  expect(text.startsWith("x".repeat(1000))).toBe(true);
+  expect(text).toContain("Diff truncated");
+  expect(text).toContain("stat_only");
+});
+
+test("get_pr_diff stat_only summarizes files and totals", async () => {
+  const getPrDiffStat = vi.fn(async () => [
+    { status: "modified" as const, lines_added: 10, lines_removed: 2, new: { path: "src/a.ts" } },
+    { status: "added" as const, lines_added: 5, lines_removed: 0, new: { path: "docs/b.md" } },
+    {
+      status: "renamed" as const,
+      lines_added: 1,
+      lines_removed: 1,
+      old: { path: "src/old.ts" },
+      new: { path: "src/newer.ts" },
+    },
+  ]);
+  const deps = makeDeps({ client: makeClientMock({ getPrDiffStat }) });
+
+  const parsed = JSON.parse(
+    extractText(await handleGetPrDiff(deps, { pr_id: 7, stat_only: true, paths: ["src"] })),
+  );
+
+  expect(parsed.files_changed).toBe(2);
+  expect(parsed.lines_added).toBe(11);
+  expect(parsed.lines_removed).toBe(3);
+  expect(parsed.files.map((f: { path: string }) => f.path)).toEqual(["src/a.ts", "src/newer.ts"]);
+  expect(parsed.files[1].old_path).toBe("src/old.ts");
+});
+
+test("get_pr_diff explains an empty path-filtered diff", async () => {
+  const deps = makeDeps({ client: makeClientMock({ getPrDiff: vi.fn(async () => "") }) });
+
+  const text = extractText(await handleGetPrDiff(deps, { pr_id: 7, paths: ["nope"] }));
+
+  expect(text).toContain("No diff content for paths: nope");
+  expect(text).toContain("stat_only");
 });
 
 test("list_pr_comments sorts oldest first and strips inline fields", async () => {
@@ -308,66 +385,398 @@ test("list_pr_comments sorts oldest first and strips inline fields", async () =>
   expect(parsed[1].inline).toEqual({ path: "src/a.ts", line_new: 42 });
 });
 
-test("get_pr_pipeline_status returns flat structured list", async () => {
-  const pipeline: BitbucketPipeline = {
+function samplePipeline(overrides: Partial<BitbucketPipeline> = {}): BitbucketPipeline {
+  return {
     uuid: "{pipe}",
-    build_number: 17,
+    build_number: 27419,
     state: { name: "COMPLETED", result: { name: "FAILED" } },
     created_on: "2024-01-03T00:00:00Z",
+    completed_on: "2024-01-03T00:10:00Z",
+    build_seconds_used: 600,
+    trigger: { name: "PUSH" },
+    target: {
+      ref_name: "feature/x",
+      commit: { hash: "deadbeefdeadbeef" },
+      selector: { type: "branches", pattern: "feature/*" },
+    },
+    ...overrides,
   };
-  const step: BitbucketStep = {
+}
+
+function sampleStep(overrides: Partial<BitbucketStep> = {}): BitbucketStep {
+  return {
     uuid: "{step}",
     name: "Test",
     state: { name: "COMPLETED", result: { name: "FAILED" } },
     started_on: "2024-01-03T00:00:05Z",
     completed_on: "2024-01-03T00:01:00Z",
+    duration_in_seconds: 55,
+    ...overrides,
   };
-  const client = makeClientMock({
-    getPrPipelineStatus: vi.fn(async () => [{ pipeline, steps: [step] }]),
-  });
-  const deps = makeDeps({ client });
+}
 
-  const result = await handleGetPrPipelineStatus(deps, { pr_id: 7 });
+test("list_pipelines reports a PR-matched pipeline with steps and a build URL", async () => {
+  const lookup: PipelineLookup = {
+    match: "pr_head_commit",
+    prId: 7,
+    branch: "feature/x",
+    commit: "deadbeefdeadbeef",
+    pipelines: [{ pipeline: samplePipeline(), steps: [sampleStep()] }],
+  };
+  const findPipelinesForPr = vi.fn(async () => lookup);
+  const deps = makeDeps({ client: makeClientMock({ findPipelinesForPr }) });
+
+  const result = await handleListPipelines(deps, { pr_id: 7 });
   const parsed = JSON.parse(extractText(result));
 
-  expect(parsed).toEqual([
-    {
-      pipeline_uuid: "{pipe}",
-      build_number: 17,
-      state: "COMPLETED",
-      result: "FAILED",
-      created_on: "2024-01-03T00:00:00Z",
-      steps: [
-        {
-          uuid: "{step}",
-          name: "Test",
-          state: "COMPLETED",
-          result: "FAILED",
-          started_on: "2024-01-03T00:00:05Z",
-          completed_on: "2024-01-03T00:01:00Z",
-        },
-      ],
+  expect(findPipelinesForPr).toHaveBeenCalledWith(
+    { workspace: "ws", repo: "r", prId: 7 },
+    { limit: 5, withSteps: true },
+  );
+  expect(parsed.match).toBe("pr_head_commit");
+  expect(parsed.note).toBeUndefined();
+  expect(parsed.pipelines[0]).toMatchObject({
+    build_number: 27419,
+    pipeline_uuid: "{pipe}",
+    state: "COMPLETED",
+    result: "FAILED",
+    trigger: "PUSH",
+    // Wall clock from created_on/completed_on, not build_seconds_used.
+    duration_seconds: 600,
+    build_seconds_used: 600,
+    url: "https://bitbucket.org/ws/r/pipelines/results/27419",
+    is_requested_commit: true,
+    target: {
+      ref_name: "feature/x",
+      commit: "deadbeefdeadbeef",
+      selector: "branches:feature/*",
     },
-  ]);
+  });
+  expect(parsed.pipelines[0].steps[0]).toMatchObject({
+    uuid: "{step}",
+    name: "Test",
+    state: "COMPLETED",
+    result: "FAILED",
+    duration_seconds: 55,
+  });
 });
 
-test("get_pipeline_step_log calls client with correct args and returns text", async () => {
-  const getPipelineStepLog = vi.fn(async () => "log text\n");
-  const client = makeClientMock({ getPipelineStepLog });
-  const deps = makeDeps({ client });
-
-  const result = await handleGetPipelineStepLog(deps, {
-    pipeline_uuid: "{pipe}",
-    step_uuid: "{step}",
+test("list_pipelines explains a branch fallback instead of returning nothing", async () => {
+  const lookup: PipelineLookup = {
+    match: "branch_fallback",
+    prId: 5605,
+    branch: "feature/x",
+    commit: "cafecafecafe",
+    pipelines: [
+      { pipeline: samplePipeline({ target: { commit: { hash: "111111111111" } } }), steps: [] },
+    ],
+  };
+  const deps = makeDeps({
+    client: makeClientMock({ findPipelinesForPr: vi.fn(async () => lookup) }),
   });
 
-  expect(result.isError).toBeFalsy();
-  expect(extractText(result)).toBe("log text\n");
+  const parsed = JSON.parse(extractText(await handleListPipelines(deps, { pr_id: 5605 })));
+
+  expect(parsed.match).toBe("branch_fallback");
+  expect(parsed.note).toContain("pull-requests:");
+  expect(parsed.note).toContain("feature/x");
+  expect(parsed.pipelines[0].is_requested_commit).toBe(false);
+});
+
+test("list_pipelines distinguishes no-pipeline-at-all from a fallback", async () => {
+  const lookup: PipelineLookup = {
+    match: "none",
+    prId: 5605,
+    branch: "feature/x",
+    commit: "cafecafecafe",
+    pipelines: [],
+  };
+  const deps = makeDeps({
+    client: makeClientMock({ findPipelinesForPr: vi.fn(async () => lookup) }),
+  });
+
+  const parsed = JSON.parse(extractText(await handleListPipelines(deps, { pr_id: 5605 })));
+
+  expect(parsed.match).toBe("none");
+  expect(parsed.note).toContain("No pipeline has ever run for branch 'feature/x'");
+  expect(parsed.pipelines).toEqual([]);
+});
+
+test("list_pipelines looks up a build number without touching the PR", async () => {
+  const getPipeline = vi.fn(async () => ({
+    pipeline: samplePipeline(),
+    steps: [sampleStep()],
+  }));
+  const getBranch = vi.fn(async () => "feature/x");
+  const deps = makeDeps({ client: makeClientMock({ getPipeline }), getBranch });
+
+  const parsed = JSON.parse(
+    extractText(await handleListPipelines(deps, { build_number: 27419, include_steps: false })),
+  );
+
+  expect(getPipeline).toHaveBeenCalledWith({ workspace: "ws", repo: "r" }, "27419", {
+    withSteps: false,
+  });
+  expect(getBranch).not.toHaveBeenCalled();
+  expect(parsed.match).toBe("build_number");
+});
+
+test("list_pipelines scopes by branch and by commit", async () => {
+  const listPipelines = vi.fn(async () => []);
+  const findPipelinesForCommit = vi.fn(async () => ({
+    match: "commit" as const,
+    commit: "abc1234",
+    pipelines: [],
+  }));
+  const client = makeClientMock({ listPipelines, findPipelinesForCommit });
+  const deps = makeDeps({ client });
+
+  const byBranch = JSON.parse(extractText(await handleListPipelines(deps, { branch: "main" })));
+  expect(listPipelines).toHaveBeenCalledWith(
+    { workspace: "ws", repo: "r" },
+    { branch: "main", limit: 5, withSteps: true },
+  );
+  expect(byBranch.match).toBe("none");
+  expect(byBranch.note).toContain("No pipeline has ever run for branch 'main'");
+
+  await handleListPipelines(deps, { commit: "abc1234", branch: "main", limit: 2 });
+  expect(findPipelinesForCommit).toHaveBeenCalledWith({ workspace: "ws", repo: "r" }, "abc1234", {
+    branch: "main",
+    limit: 2,
+    withSteps: true,
+  });
+});
+
+test("list_pipelines prefers an explicit pr_id over branch", async () => {
+  const listPipelines = vi.fn(async () => []);
+  const findPipelinesForPr = vi.fn(async () => ({
+    match: "pr_head_commit" as const,
+    prId: 7,
+    pipelines: [],
+  }));
+  const deps = makeDeps({ client: makeClientMock({ listPipelines, findPipelinesForPr }) });
+
+  await handleListPipelines(deps, { pr_id: 7, branch: "main" });
+
+  expect(findPipelinesForPr).toHaveBeenCalled();
+  expect(listPipelines).not.toHaveBeenCalled();
+});
+
+test("get_pipeline_step_log skips steps that have not started", async () => {
+  const listPipelineSteps = vi.fn(async () => [
+    sampleStep({
+      uuid: "{step-done}",
+      name: "Build",
+      state: { name: "COMPLETED", result: { name: "SUCCESSFUL" } },
+    }),
+    sampleStep({
+      uuid: "{step-pending}",
+      name: "Deploy",
+      state: { name: "PENDING" },
+      started_on: undefined,
+      completed_on: undefined,
+    }),
+  ]);
+  const getPipelineStepLog = vi.fn(async () => "output");
+  const deps = makeDeps({ client: makeClientMock({ listPipelineSteps, getPipelineStepLog }) });
+
+  await handleGetPipelineStepLog(deps, { pipeline_uuid: "27419" });
+
   expect(getPipelineStepLog).toHaveBeenCalledWith(
     { workspace: "ws", repo: "r" },
-    "{pipe}",
-    "{step}",
+    "27419",
+    "{step-done}",
   );
+});
+
+test("list_pipelines suggests branch/commit lookup when no PR can be resolved", async () => {
+  const client = makeClientMock({ listPrs: vi.fn(async () => []) });
+  const deps = makeDeps({ client, getBranch: vi.fn(async () => "feature/x") });
+
+  const result = await handleListPipelines(deps, {});
+
+  expect(result.isError).toBe(true);
+  expect(extractText(result)).toContain("`branch`");
+});
+
+test("get_pipeline_step_log defaults to the first failed step and adds a status header", async () => {
+  const listPipelineSteps = vi.fn(async () => [
+    sampleStep({
+      uuid: "{step-ok}",
+      name: "Build",
+      state: { name: "COMPLETED", result: { name: "SUCCESSFUL" } },
+    }),
+    sampleStep({ uuid: "{step-bad}", name: "Test" }),
+  ]);
+  const getPipelineStepLog = vi.fn(async () => "line1\nline2\n");
+  const client = makeClientMock({ listPipelineSteps, getPipelineStepLog });
+  const deps = makeDeps({ client });
+
+  const result = await handleGetPipelineStepLog(deps, { pipeline_uuid: "27419" });
+  const text = extractText(result);
+
+  expect(getPipelineStepLog).toHaveBeenCalledWith(
+    { workspace: "ws", repo: "r" },
+    "27419",
+    "{step-bad}",
+  );
+  expect(text).toContain('step "Test" {step-bad} — COMPLETED/FAILED, 55s');
+  expect(text).toContain("line1\nline2");
+});
+
+test("get_pipeline_step_log honours tail_lines and notes the trim", async () => {
+  const log = Array.from({ length: 100 }, (_, i) => `line${i + 1}`).join("\n") + "\n";
+  const client = makeClientMock({ getPipelineStepLog: vi.fn(async () => log) });
+  const deps = makeDeps({ client });
+
+  const text = extractText(
+    await handleGetPipelineStepLog(deps, {
+      pipeline_uuid: "{pipe}",
+      step_uuid: "{step}",
+      tail_lines: 3,
+    }),
+  );
+
+  expect(text).toContain("last 3 of 100 lines");
+  expect(text).toContain("line98\nline99\nline100");
+  expect(text).not.toContain("line97\n");
+});
+
+test("get_pipeline_step_log caps output at max_bytes keeping the end", async () => {
+  const log = `${"x".repeat(5000)}TAIL`;
+  const client = makeClientMock({ getPipelineStepLog: vi.fn(async () => log) });
+  const deps = makeDeps({ client });
+
+  const text = extractText(
+    await handleGetPipelineStepLog(deps, {
+      pipeline_uuid: "{pipe}",
+      step_uuid: "{step}",
+      max_bytes: 1000,
+    }),
+  );
+
+  expect(text).toContain("TAIL");
+  expect(text).toContain("last 1000 B of");
+  expect(text.length).toBeLessThan(1400);
+});
+
+test("get_pipeline_step_log reports a pipeline with no steps", async () => {
+  const client = makeClientMock({ listPipelineSteps: vi.fn(async () => []) });
+  const deps = makeDeps({ client });
+
+  const result = await handleGetPipelineStepLog(deps, { pipeline_uuid: "27419" });
+
+  expect(result.isError).toBe(true);
+  expect(extractText(result)).toContain("no steps yet");
+});
+
+test("get_build_status summarizes commit statuses for the checkout HEAD", async () => {
+  const getCommitStatuses = vi.fn(async () => [
+    { key: "PIPELINE", name: "Pipeline #27419", state: "SUCCESSFUL" as const },
+    { key: "LINT", state: "INPROGRESS" as const },
+  ]);
+  const client = makeClientMock({ getCommitStatuses });
+  const deps = makeDeps({ client, getHeadSha: vi.fn(async () => "b".repeat(40)) });
+
+  const parsed = JSON.parse(extractText(await handleGetBuildStatus(deps, {})));
+
+  expect(getCommitStatuses).toHaveBeenCalledWith({ workspace: "ws", repo: "r" }, "b".repeat(40));
+  expect(parsed.verdict).toBe("INPROGRESS");
+  expect(parsed.target).toEqual({ type: "commit", commit: "b".repeat(40) });
+  expect(parsed.statuses).toHaveLength(2);
+});
+
+test("get_build_status uses the PR statuses endpoint when given a pr_id", async () => {
+  const getPrStatuses = vi.fn(async () => [{ key: "PIPELINE", state: "FAILED" as const }]);
+  const deps = makeDeps({ client: makeClientMock({ getPrStatuses }) });
+
+  const parsed = JSON.parse(extractText(await handleGetBuildStatus(deps, { pr_id: 7 })));
+
+  expect(getPrStatuses).toHaveBeenCalledWith({ workspace: "ws", repo: "r", prId: 7 });
+  expect(parsed.verdict).toBe("FAILED");
+  expect(parsed.target).toEqual({ type: "pull_request", pr_id: 7 });
+});
+
+test("get_build_status flags an empty status list as NO_STATUSES with a caveat", async () => {
+  const deps = makeDeps({ client: makeClientMock({ getCommitStatuses: vi.fn(async () => []) }) });
+
+  const parsed = JSON.parse(extractText(await handleGetBuildStatus(deps, { commit: "abc1234" })));
+
+  expect(parsed.verdict).toBe("NO_STATUSES");
+  expect(parsed.note).toContain("list_pipelines");
+});
+
+test("get_build_status errors when there is no commit to check", async () => {
+  const deps = makeDeps({ getHeadSha: vi.fn(async () => null) });
+
+  const result = await handleGetBuildStatus(deps, {});
+
+  expect(result.isError).toBe(true);
+  expect(extractText(result)).toContain("Pass `commit`");
+});
+
+test("run_pipeline defaults to the current branch and reports the new build", async () => {
+  const triggerPipeline = vi.fn(async () => samplePipeline({ build_number: 27420 }));
+  const deps = makeDeps({
+    client: makeClientMock({ triggerPipeline }),
+    getBranch: vi.fn(async () => "feature/x"),
+  });
+
+  const text = extractText(await handleRunPipeline(deps, {}));
+
+  expect(triggerPipeline).toHaveBeenCalledWith(
+    { workspace: "ws", repo: "r" },
+    { branch: "feature/x", commit: undefined, customPipeline: undefined, variables: undefined },
+  );
+  expect(text).toContain("Started pipeline #27420 on feature/x");
+  expect(text).toContain("https://bitbucket.org/ws/r/pipelines/results/27420");
+});
+
+test("run_pipeline passes a custom pipeline and variables through", async () => {
+  const triggerPipeline = vi.fn(async () => samplePipeline());
+  const deps = makeDeps({ client: makeClientMock({ triggerPipeline }) });
+
+  const text = extractText(
+    await handleRunPipeline(deps, {
+      branch: "main",
+      custom_pipeline: "Deploy",
+      variables: [{ key: "K", value: "V" }],
+    }),
+  );
+
+  expect(triggerPipeline).toHaveBeenCalledWith(
+    { workspace: "ws", repo: "r" },
+    {
+      branch: "main",
+      commit: undefined,
+      customPipeline: "Deploy",
+      variables: [{ key: "K", value: "V" }],
+    },
+  );
+  expect(text).toContain('Started custom pipeline "Deploy"');
+});
+
+test("run_pipeline turns a 403 into a scope/permission hint", async () => {
+  const triggerPipeline = vi.fn(async () => {
+    throw new BitbucketError("forbidden", 403, "no write access");
+  });
+  const deps = makeDeps({ client: makeClientMock({ triggerPipeline }) });
+
+  const result = await handleRunPipeline(deps, { branch: "main" });
+
+  expect(result.isError).toBe(true);
+  const text = extractText(result);
+  expect(text).toContain("pipeline:write");
+  expect(text).toContain("bitbucket-mcp setup");
+});
+
+test("run_pipeline errors when the branch cannot be determined", async () => {
+  const deps = makeDeps({ getBranch: vi.fn(async () => null) });
+
+  const result = await handleRunPipeline(deps, {});
+
+  expect(result.isError).toBe(true);
+  expect(extractText(result)).toContain("Pass `branch`");
 });
 
 test("add_pr_comment posts and returns confirmation message", async () => {

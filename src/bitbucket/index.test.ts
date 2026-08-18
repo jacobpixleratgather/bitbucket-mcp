@@ -1,6 +1,11 @@
 import { afterEach, beforeEach, expect, test, vi } from "vite-plus/test";
 import { BitbucketError, type BitbucketPr } from "../types.ts";
-import { BitbucketClient } from "./index.ts";
+import {
+  BitbucketClient,
+  filterDiffByPaths,
+  normalizePipelineId,
+  normalizeStepUuid,
+} from "./index.ts";
 
 type Call = {
   url: string;
@@ -816,70 +821,311 @@ test("resolvePrComment(false) issues DELETE and returns undefined for 204", asyn
   );
 });
 
-// ---------- getPrPipelineStatus ----------
+// ---------- pipeline discovery ----------
 
-test("getPrPipelineStatus makes the right sequence of calls", async () => {
-  const pipelineA = {
-    uuid: "{uuid-A}",
-    build_number: 101,
-    state: { name: "COMPLETED" },
-    created_on: "2026-04-20T10:00:00Z",
+function samplePipeline(
+  overrides: {
+    uuid?: string;
+    build_number?: number;
+    created_on?: string;
+    commit?: string;
+    prId?: number;
+    result?: string;
+  } = {},
+): unknown {
+  return {
+    uuid: overrides.uuid ?? "{uuid-A}",
+    build_number: overrides.build_number ?? 101,
+    state: {
+      name: "COMPLETED",
+      result: { name: overrides.result ?? "SUCCESSFUL" },
+    },
+    created_on: overrides.created_on ?? "2026-04-20T10:00:00Z",
+    trigger: { name: "PUSH" },
     target: {
       ref_name: "feature/x",
-      commit: { hash: "deadbeef" },
+      commit: { hash: overrides.commit ?? "deadbeef" },
+      selector: { type: "branches", pattern: "feature/*" },
+      ...(overrides.prId !== undefined ? { pullrequest: { id: overrides.prId } } : {}),
     },
   };
-  const pipelineB = {
+}
+
+const SAMPLE_STEPS = [
+  {
+    uuid: "{step-1}",
+    name: "build",
+    state: { name: "COMPLETED", result: { name: "SUCCESSFUL" } },
+    duration_in_seconds: 42,
+  },
+];
+
+test("findPipelinesForPr matches the PR head commit and attaches steps", async () => {
+  const matching = samplePipeline({ uuid: "{uuid-A}", commit: "deadbeef" });
+  const other = samplePipeline({
     uuid: "{uuid-B}",
     build_number: 102,
-    state: { name: "IN_PROGRESS" },
     created_on: "2026-04-20T11:00:00Z",
-    target: {
-      ref_name: "feature/x",
-      commit: { hash: "otherhash" }, // should be filtered out
-    },
-  };
-  const stepsA = [
-    {
-      uuid: "{step-1}",
-      name: "build",
-      state: { name: "COMPLETED", result: { name: "SUCCESSFUL" } },
-    },
-  ];
+    commit: "otherhash",
+  });
   const { fetch, calls } = makeScriptedFetch([
     { status: 200, body: JSON.stringify(SAMPLE_PR) },
-    {
-      status: 200,
-      body: JSON.stringify({ values: [pipelineB, pipelineA] }),
-    },
-    { status: 200, body: JSON.stringify({ values: stepsA }) },
+    { status: 200, body: JSON.stringify({ values: [other, matching] }) },
+    { status: 200, body: JSON.stringify({ values: SAMPLE_STEPS }) },
   ]);
-  const client = new BitbucketClient({
-    getAccessToken: async () => "t",
-    fetch,
-  });
-  const result = await client.getPrPipelineStatus({
+  const client = new BitbucketClient({ getAccessToken: async () => "t", fetch });
+
+  const lookup = await client.findPipelinesForPr({
     workspace: "ws",
     repo: "repo",
     prId: 42,
   });
 
-  // Call 1: get PR.
   expect(calls[0]?.url).toBe("https://api.bitbucket.org/2.0/repositories/ws/repo/pullrequests/42");
-  // Call 2: list pipelines for the PR's source branch, newest first.
   const plUrl = new URL(calls[1]?.url ?? "");
   expect(plUrl.pathname).toBe("/2.0/repositories/ws/repo/pipelines/");
   expect(plUrl.searchParams.get("target.branch")).toBe("feature/x");
   expect(plUrl.searchParams.get("sort")).toBe("-created_on");
-  // Call 3: steps for pipelineA only (commit matches PR head).
   expect(calls[2]?.url).toBe(
     `https://api.bitbucket.org/2.0/repositories/ws/repo/pipelines/${encodeURIComponent(
       "{uuid-A}",
     )}/steps/`,
   );
-  expect(result).toHaveLength(1);
-  expect(result[0]?.pipeline.uuid).toBe("{uuid-A}");
-  expect(result[0]?.steps).toHaveLength(1);
+  expect(lookup.match).toBe("pr_head_commit");
+  expect(lookup.branch).toBe("feature/x");
+  expect(lookup.commit).toBe("deadbeef");
+  expect(lookup.pipelines).toHaveLength(1);
+  expect(lookup.pipelines[0]?.pipeline.uuid).toBe("{uuid-A}");
+  expect(lookup.pipelines[0]?.steps).toHaveLength(1);
+});
+
+test("findPipelinesForPr matches a PR-triggered pipeline even on a different commit", async () => {
+  const prTriggered = samplePipeline({ uuid: "{uuid-pr}", commit: "feedface", prId: 42 });
+  const { fetch } = makeScriptedFetch([
+    { status: 200, body: JSON.stringify(SAMPLE_PR) },
+    { status: 200, body: JSON.stringify({ values: [prTriggered] }) },
+    { status: 200, body: JSON.stringify({ values: SAMPLE_STEPS }) },
+  ]);
+  const client = new BitbucketClient({ getAccessToken: async () => "t", fetch });
+
+  const lookup = await client.findPipelinesForPr({ workspace: "ws", repo: "repo", prId: 42 });
+
+  expect(lookup.match).toBe("pr_head_commit");
+  expect(lookup.pipelines[0]?.pipeline.uuid).toBe("{uuid-pr}");
+});
+
+test("findPipelinesForPr falls back to the branch when no pipeline matches the PR", async () => {
+  // The repo builds on branch push only: pipelines exist for the branch but
+  // none is PR-attributable and none built the PR's head commit.
+  const older = samplePipeline({ uuid: "{uuid-old}", commit: "1111111111", build_number: 100 });
+  const newer = samplePipeline({
+    uuid: "{uuid-new}",
+    commit: "2222222222",
+    build_number: 103,
+    created_on: "2026-04-20T12:00:00Z",
+  });
+  const { fetch } = makeScriptedFetch([
+    { status: 200, body: JSON.stringify(SAMPLE_PR) },
+    { status: 200, body: JSON.stringify({ values: [older, newer] }) },
+    { status: 200, body: JSON.stringify({ values: SAMPLE_STEPS }) },
+    { status: 200, body: JSON.stringify({ values: SAMPLE_STEPS }) },
+  ]);
+  const client = new BitbucketClient({ getAccessToken: async () => "t", fetch });
+
+  const lookup = await client.findPipelinesForPr({ workspace: "ws", repo: "repo", prId: 42 });
+
+  expect(lookup.match).toBe("branch_fallback");
+  expect(lookup.branch).toBe("feature/x");
+  expect(lookup.commit).toBe("deadbeef");
+  // Newest first.
+  expect(lookup.pipelines.map((e) => e.pipeline.uuid)).toEqual(["{uuid-new}", "{uuid-old}"]);
+});
+
+test("findPipelinesForPr reports none when the branch has no pipelines", async () => {
+  const { fetch } = makeScriptedFetch([
+    { status: 200, body: JSON.stringify(SAMPLE_PR) },
+    { status: 200, body: JSON.stringify({ values: [] }) },
+  ]);
+  const client = new BitbucketClient({ getAccessToken: async () => "t", fetch });
+
+  const lookup = await client.findPipelinesForPr({ workspace: "ws", repo: "repo", prId: 42 });
+
+  expect(lookup.match).toBe("none");
+  expect(lookup.pipelines).toEqual([]);
+});
+
+test("findPipelinesForCommit filters server-side for a full hash", async () => {
+  const full = "a".repeat(40);
+  const { fetch, calls } = makeScriptedFetch([
+    { status: 200, body: JSON.stringify({ values: [samplePipeline({ commit: full })] }) },
+    { status: 200, body: JSON.stringify({ values: SAMPLE_STEPS }) },
+  ]);
+  const client = new BitbucketClient({ getAccessToken: async () => "t", fetch });
+
+  const lookup = await client.findPipelinesForCommit({ workspace: "ws", repo: "repo" }, full);
+
+  const url = new URL(calls[0]?.url ?? "");
+  expect(url.searchParams.get("target.commit.hash")).toBe(full);
+  expect(lookup.match).toBe("commit");
+  expect(lookup.pipelines).toHaveLength(1);
+});
+
+test("findPipelinesForCommit prefix-matches a short hash client-side", async () => {
+  const full = "abcdef1234567890abcdef1234567890abcdef12";
+  const { fetch, calls } = makeScriptedFetch([
+    {
+      status: 200,
+      body: JSON.stringify({
+        values: [samplePipeline({ commit: "999999999999" }), samplePipeline({ commit: full })],
+      }),
+    },
+    { status: 200, body: JSON.stringify({ values: SAMPLE_STEPS }) },
+  ]);
+  const client = new BitbucketClient({ getAccessToken: async () => "t", fetch });
+
+  const lookup = await client.findPipelinesForCommit(
+    { workspace: "ws", repo: "repo" },
+    "abcdef12345",
+  );
+
+  // Short hashes can't be filtered server-side, so no commit param is sent.
+  const url = new URL(calls[0]?.url ?? "");
+  expect(url.searchParams.get("target.commit.hash")).toBeNull();
+  expect(lookup.match).toBe("commit");
+  expect(lookup.pipelines).toHaveLength(1);
+  expect(lookup.pipelines[0]?.pipeline.target?.commit?.hash).toBe(full);
+});
+
+test("findPipelinesForCommit reports none when nothing built the commit", async () => {
+  const { fetch } = makeScriptedFetch([
+    // Server-side filter finds nothing, then the client-side scan finds no
+    // pipeline whose commit matches either.
+    { status: 200, body: JSON.stringify({ values: [] }) },
+    { status: 200, body: JSON.stringify({ values: [samplePipeline({ commit: "cafecafecafe" })] }) },
+  ]);
+  const client = new BitbucketClient({ getAccessToken: async () => "t", fetch });
+
+  const lookup = await client.findPipelinesForCommit(
+    { workspace: "ws", repo: "repo" },
+    "b".repeat(40),
+  );
+
+  expect(lookup.match).toBe("none");
+  expect(lookup.pipelines).toEqual([]);
+});
+
+test("listPipelines scopes by branch and can skip steps", async () => {
+  const { fetch, calls } = makeScriptedFetch([
+    { status: 200, body: JSON.stringify({ values: [samplePipeline()] }) },
+  ]);
+  const client = new BitbucketClient({ getAccessToken: async () => "t", fetch });
+
+  const out = await client.listPipelines(
+    { workspace: "ws", repo: "repo" },
+    { branch: "main", limit: 3, withSteps: false },
+  );
+
+  const url = new URL(calls[0]?.url ?? "");
+  expect(url.searchParams.get("target.branch")).toBe("main");
+  expect(url.searchParams.get("pagelen")).toBe("3");
+  expect(calls).toHaveLength(1);
+  expect(out[0]?.steps).toEqual([]);
+});
+
+test("getPipeline accepts a build number in the uuid slot", async () => {
+  const { fetch, calls } = makeScriptedFetch([
+    { status: 200, body: JSON.stringify(samplePipeline({ build_number: 27419 })) },
+    { status: 200, body: JSON.stringify({ values: SAMPLE_STEPS }) },
+  ]);
+  const client = new BitbucketClient({ getAccessToken: async () => "t", fetch });
+
+  const entry = await client.getPipeline({ workspace: "ws", repo: "repo" }, "27419");
+
+  expect(calls[0]?.url).toBe("https://api.bitbucket.org/2.0/repositories/ws/repo/pipelines/27419");
+  expect(entry.pipeline.build_number).toBe(27419);
+  expect(entry.steps).toHaveLength(1);
+});
+
+// ---------- triggerPipeline ----------
+
+test("triggerPipeline posts a branch ref target", async () => {
+  const { fetch, calls } = makeScriptedFetch([
+    { status: 201, body: JSON.stringify(samplePipeline({ build_number: 27420 })) },
+  ]);
+  const client = new BitbucketClient({ getAccessToken: async () => "t", fetch });
+
+  const pipeline = await client.triggerPipeline(
+    { workspace: "ws", repo: "repo" },
+    { branch: "feature/x" },
+  );
+
+  expect(calls[0]?.url).toBe("https://api.bitbucket.org/2.0/repositories/ws/repo/pipelines/");
+  expect(calls[0]?.method).toBe("POST");
+  expect(JSON.parse(calls[0]?.body ?? "{}")).toEqual({
+    target: { type: "pipeline_ref_target", ref_type: "branch", ref_name: "feature/x" },
+  });
+  expect(pipeline.build_number).toBe(27420);
+});
+
+test("triggerPipeline posts commit, custom selector, and variables", async () => {
+  const { fetch, calls } = makeScriptedFetch([
+    { status: 201, body: JSON.stringify(samplePipeline()) },
+  ]);
+  const client = new BitbucketClient({ getAccessToken: async () => "t", fetch });
+
+  await client.triggerPipeline(
+    { workspace: "ws", repo: "repo" },
+    {
+      branch: "main",
+      commit: "abc1234",
+      customPipeline: "Deploy to production",
+      variables: [{ key: "K", value: "V", secured: true }],
+    },
+  );
+
+  expect(JSON.parse(calls[0]?.body ?? "{}")).toEqual({
+    target: {
+      type: "pipeline_ref_target",
+      ref_type: "branch",
+      ref_name: "main",
+      commit: { type: "commit", hash: "abc1234" },
+      selector: { type: "custom", pattern: "Deploy to production" },
+    },
+    variables: [{ key: "K", value: "V", secured: true }],
+  });
+});
+
+// ---------- commit statuses ----------
+
+test("getCommitStatuses hits the commit statuses endpoint", async () => {
+  const { fetch, calls } = makeScriptedFetch([
+    {
+      status: 200,
+      body: JSON.stringify({
+        values: [{ key: "PIPELINE", state: "SUCCESSFUL", name: "Pipeline #1" }],
+      }),
+    },
+  ]);
+  const client = new BitbucketClient({ getAccessToken: async () => "t", fetch });
+
+  const statuses = await client.getCommitStatuses({ workspace: "ws", repo: "repo" }, "abc123");
+
+  const url = new URL(calls[0]?.url ?? "");
+  expect(url.pathname).toBe("/2.0/repositories/ws/repo/commit/abc123/statuses");
+  expect(statuses[0]?.state).toBe("SUCCESSFUL");
+});
+
+test("getPrStatuses hits the PR statuses endpoint", async () => {
+  const { fetch, calls } = makeScriptedFetch([
+    { status: 200, body: JSON.stringify({ values: [{ key: "PIPELINE", state: "FAILED" }] }) },
+  ]);
+  const client = new BitbucketClient({ getAccessToken: async () => "t", fetch });
+
+  const statuses = await client.getPrStatuses({ workspace: "ws", repo: "repo", prId: 42 });
+
+  const url = new URL(calls[0]?.url ?? "");
+  expect(url.pathname).toBe("/2.0/repositories/ws/repo/pullrequests/42/statuses");
+  expect(statuses[0]?.state).toBe("FAILED");
 });
 
 // ---------- getPipelineStepLog ----------
@@ -919,4 +1165,109 @@ test("getPipelineStepLog 404 throws helpful BitbucketError", async () => {
   await expect(
     client.getPipelineStepLog({ workspace: "ws", repo: "repo" }, "{pipe}", "{step}"),
   ).rejects.toThrow(/no log available/);
+});
+
+// ---------- diff path filtering & diffstat ----------
+
+const TWO_FILE_DIFF = [
+  "diff --git a/src/a.ts b/src/a.ts",
+  "--- a/src/a.ts",
+  "+++ b/src/a.ts",
+  "@@ -1 +1 @@",
+  "-a",
+  "+A",
+  "diff --git a/docs/b.md b/docs/b.md",
+  "--- a/docs/b.md",
+  "+++ b/docs/b.md",
+  "@@ -1 +1 @@",
+  "-b",
+  "+B",
+  "",
+].join("\n");
+
+test("getPrDiff filters by path client-side, not via the endpoint's path param", async () => {
+  const { fetch, calls } = makeScriptedFetch([{ status: 200, body: TWO_FILE_DIFF }]);
+  const client = new BitbucketClient({ getAccessToken: async () => "t", fetch });
+
+  const diff = await client.getPrDiff(
+    { workspace: "ws", repo: "repo", prId: 42 },
+    { paths: ["src", "nope/x.ts"] },
+  );
+
+  // Bitbucket's `path` param only matches whole files: sending a directory
+  // there returns an empty diff, so we never send it.
+  const url = new URL(calls[0]?.url ?? "");
+  expect(url.searchParams.getAll("path")).toEqual([]);
+  expect(url.pathname).toBe("/2.0/repositories/ws/repo/pullrequests/42/diff");
+  expect(diff).toContain("src/a.ts");
+  expect(diff).not.toContain("docs/b.md");
+});
+
+test("getPrDiffStat paginates the diffstat endpoint", async () => {
+  const { fetch, calls } = makeScriptedFetch([
+    {
+      status: 200,
+      body: JSON.stringify({
+        values: [
+          { status: "modified", lines_added: 3, lines_removed: 1, new: { path: "src/a.ts" } },
+        ],
+      }),
+    },
+  ]);
+  const client = new BitbucketClient({ getAccessToken: async () => "t", fetch });
+
+  const stat = await client.getPrDiffStat({ workspace: "ws", repo: "repo", prId: 42 });
+
+  const url = new URL(calls[0]?.url ?? "");
+  expect(url.pathname).toBe("/2.0/repositories/ws/repo/pullrequests/42/diffstat");
+  expect(stat[0]?.lines_added).toBe(3);
+});
+
+test("filterDiffByPaths matches exact files, directory prefixes, and quoted paths", () => {
+  expect(filterDiffByPaths(TWO_FILE_DIFF, ["docs/b.md"])).toBe(
+    [
+      "diff --git a/docs/b.md b/docs/b.md",
+      "--- a/docs/b.md",
+      "+++ b/docs/b.md",
+      "@@ -1 +1 @@",
+      "-b",
+      "+B",
+      "",
+    ].join("\n"),
+  );
+  expect(filterDiffByPaths(TWO_FILE_DIFF, ["docs/"])).toContain("docs/b.md");
+  expect(filterDiffByPaths(TWO_FILE_DIFF, ["./src"])).toContain("src/a.ts");
+  expect(filterDiffByPaths(TWO_FILE_DIFF, ["missing"])).toBe("");
+  const quoted = 'diff --git "a/src/my file.ts" "b/src/my file.ts"\n+x\n';
+  expect(filterDiffByPaths(quoted, ["src/my file.ts"])).toContain("my file.ts");
+});
+
+// ---------- id normalization ----------
+
+test("normalizePipelineId passes build numbers through and braces bare UUIDs", () => {
+  expect(normalizePipelineId("27419")).toBe("27419");
+  expect(normalizePipelineId(" {a1b2c3d4-1111-2222-3333-444455556666} ")).toBe(
+    "{a1b2c3d4-1111-2222-3333-444455556666}",
+  );
+  expect(normalizePipelineId("a1b2c3d4-1111-2222-3333-444455556666")).toBe(
+    "{a1b2c3d4-1111-2222-3333-444455556666}",
+  );
+});
+
+test("getPipelineStepLog braces a bare step UUID", async () => {
+  const { fetch, calls } = makeScriptedFetch([{ status: 200, body: "output" }]);
+  const client = new BitbucketClient({ getAccessToken: async () => "t", fetch });
+
+  await client.getPipelineStepLog(
+    { workspace: "ws", repo: "repo" },
+    "27419",
+    "a1b2c3d4-1111-2222-3333-444455556666",
+  );
+
+  expect(calls[0]?.url).toBe(
+    `https://api.bitbucket.org/2.0/repositories/ws/repo/pipelines/27419/steps/${encodeURIComponent(
+      "{a1b2c3d4-1111-2222-3333-444455556666}",
+    )}/log`,
+  );
+  expect(normalizeStepUuid("{x}")).toBe("{x}");
 });

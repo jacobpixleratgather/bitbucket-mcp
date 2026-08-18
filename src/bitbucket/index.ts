@@ -1,9 +1,14 @@
 import {
   BitbucketError,
   type BitbucketComment,
+  type BitbucketCommitStatus,
+  type BitbucketDiffstat,
   type BitbucketPipeline,
   type BitbucketPr,
   type BitbucketStep,
+  type PipelineLookup,
+  type PipelineVariable,
+  type PipelineWithSteps,
   type PrTarget,
   type RepoTarget,
   type TokenProvider,
@@ -13,6 +18,13 @@ const BASE_URL = "https://api.bitbucket.org/2.0";
 
 const DEFAULT_PR_LIMIT = 50;
 const DEFAULT_COMMENT_LIMIT = 100;
+const DEFAULT_DIFFSTAT_LIMIT = 300;
+const DEFAULT_PIPELINE_LIMIT = 5;
+const DEFAULT_STATUS_LIMIT = 50;
+// How many recent pipelines on a branch to scan when looking for one that
+// matches a specific commit. Bitbucket's `target.commit.hash` filter needs a
+// full 40-char hash, so short hashes are matched client-side over this window.
+const PIPELINE_SCAN_WINDOW = 50;
 const PAGINATION_HARD_CAP = 500;
 
 const MAX_BACKOFF_ATTEMPTS = 3;
@@ -98,11 +110,31 @@ export class BitbucketClient {
     return await this.#paginate<BitbucketPr>(url, limit);
   }
 
-  async getPrDiff(t: PrTarget): Promise<string> {
+  async getPrDiff(t: PrTarget, opts?: { paths?: string[] }): Promise<string> {
     const url = `${BASE_URL}/repositories/${encode(t.workspace)}/${encode(
       t.repo,
     )}/pullrequests/${t.prId}/diff`;
-    return await this.#requestText(url, { accept: "*/*" });
+    const diff = await this.#requestText(url, { accept: "*/*" });
+    const paths = opts?.paths ?? [];
+    if (paths.length === 0) {
+      return diff;
+    }
+    // Filtering happens here, not via the endpoint's `path` query param: that
+    // param only matches whole file paths, so passing a directory returns an
+    // empty diff (verified against the live API). Fetching the full diff and
+    // filtering locally costs bandwidth, never correctness — and the point of
+    // this filter is to spend fewer tokens, not fewer bytes.
+    return filterDiffByPaths(diff, paths);
+  }
+
+  async getPrDiffStat(t: PrTarget, opts?: { limit?: number }): Promise<BitbucketDiffstat[]> {
+    const limit = clampLimit(opts?.limit, DEFAULT_DIFFSTAT_LIMIT);
+    const params = new URLSearchParams();
+    params.set("pagelen", String(Math.min(100, limit)));
+    const url = `${BASE_URL}/repositories/${encode(t.workspace)}/${encode(
+      t.repo,
+    )}/pullrequests/${t.prId}/diffstat?${params.toString()}`;
+    return await this.#paginate<BitbucketDiffstat>(url, limit);
   }
 
   async listPrComments(t: PrTarget, opts?: { limit?: number }): Promise<BitbucketComment[]> {
@@ -262,49 +294,240 @@ export class BitbucketClient {
     });
   }
 
-  async getPrPipelineStatus(
+  /**
+   * Lists pipelines in the repo, newest first, optionally scoped to a branch
+   * and/or a commit. Steps are attached unless `withSteps` is false.
+   */
+  async listPipelines(
+    t: RepoTarget,
+    opts?: {
+      branch?: string;
+      commit?: string;
+      limit?: number;
+      withSteps?: boolean;
+    },
+  ): Promise<PipelineWithSteps[]> {
+    const limit = clampLimit(opts?.limit, DEFAULT_PIPELINE_LIMIT);
+    const pipelines = await this.#fetchPipelines(t, {
+      branch: opts?.branch,
+      commit: opts?.commit,
+      pagelen: limit,
+    });
+    return await this.#attachSteps(t, pipelines.slice(0, limit), opts?.withSteps ?? true);
+  }
+
+  /**
+   * Fetches a single pipeline by UUID or by build number. Bitbucket accepts
+   * either in the `{pipeline_uuid}` path segment.
+   */
+  async getPipeline(
+    t: RepoTarget,
+    pipelineId: string,
+    opts?: { withSteps?: boolean },
+  ): Promise<PipelineWithSteps> {
+    const id = normalizePipelineId(pipelineId);
+    const url = `${BASE_URL}/repositories/${encode(t.workspace)}/${encode(
+      t.repo,
+    )}/pipelines/${encode(id)}`;
+    const pipeline = await this.#requestJson<BitbucketPipeline>(url);
+    const withSteps = await this.#attachSteps(t, [pipeline], opts?.withSteps ?? true);
+    const only = withSteps[0];
+    if (only === undefined) {
+      // #attachSteps always returns one entry per input pipeline.
+      return { pipeline, steps: [] };
+    }
+    return only;
+  }
+
+  async listPipelineSteps(t: RepoTarget, pipelineId: string): Promise<BitbucketStep[]> {
+    const id = normalizePipelineId(pipelineId);
+    const url = `${BASE_URL}/repositories/${encode(t.workspace)}/${encode(
+      t.repo,
+    )}/pipelines/${encode(id)}/steps/`;
+    const page = await this.#requestJson<BitbucketPage<BitbucketStep>>(url);
+    return page.values;
+  }
+
+  /**
+   * Finds pipelines that built a specific commit. Bitbucket's
+   * `target.commit.hash` filter only matches full 40-char hashes, so short
+   * hashes fall back to a client-side prefix match over recent pipelines.
+   */
+  async findPipelinesForCommit(
+    t: RepoTarget,
+    commit: string,
+    opts?: { branch?: string; limit?: number; withSteps?: boolean },
+  ): Promise<PipelineLookup> {
+    const limit = clampLimit(opts?.limit, DEFAULT_PIPELINE_LIMIT);
+    const isFullHash = /^[0-9a-f]{40}$/i.test(commit);
+
+    let matching: BitbucketPipeline[] = [];
+    if (isFullHash) {
+      matching = await this.#fetchPipelines(t, {
+        branch: opts?.branch,
+        commit,
+        pagelen: limit,
+      });
+    }
+    if (matching.length === 0) {
+      const recent = await this.#fetchPipelines(t, {
+        branch: opts?.branch,
+        pagelen: PIPELINE_SCAN_WINDOW,
+      });
+      matching = recent.filter((p) => commitMatches(p.target?.commit?.hash, commit));
+    }
+
+    return {
+      match: matching.length > 0 ? "commit" : "none",
+      commit,
+      branch: opts?.branch,
+      pipelines: await this.#attachSteps(t, matching.slice(0, limit), opts?.withSteps ?? true),
+    };
+  }
+
+  /**
+   * Finds the pipelines relevant to a PR.
+   *
+   * Prefers pipelines attributable to the PR — either PR-triggered (the repo's
+   * bitbucket-pipelines.yml has a `pull-requests:` section) or built from the
+   * PR's head commit. When neither exists, falls back to the most recent
+   * pipelines on the PR's source branch and reports `branch_fallback`, which is
+   * the common case for repos that build only on branch push. `none` means no
+   * pipeline ran for the branch at all.
+   */
+  async findPipelinesForPr(
     t: PrTarget,
-  ): Promise<Array<{ pipeline: BitbucketPipeline; steps: BitbucketStep[] }>> {
+    opts?: { limit?: number; withSteps?: boolean },
+  ): Promise<PipelineLookup> {
+    const limit = clampLimit(opts?.limit, DEFAULT_PIPELINE_LIMIT);
     const pr = await this.getPr(t);
     const branch = pr.source.branch.name;
     const headCommit = pr.source.commit.hash;
+    const withSteps = opts?.withSteps ?? true;
 
-    const params = new URLSearchParams();
-    params.set("target.branch", branch);
-    params.set("sort", "-created_on");
-    params.set("pagelen", "20");
-    const pipelinesUrl = `${BASE_URL}/repositories/${encode(
-      t.workspace,
-    )}/${encode(t.repo)}/pipelines/?${params.toString()}`;
-    const page = await this.#requestJson<BitbucketPage<BitbucketPipeline>>(pipelinesUrl);
-
-    const matching = page.values.filter((p) => {
-      const hash = p.target?.commit?.hash;
-      return hash !== undefined && hash === headCommit;
+    const candidates = await this.#fetchPipelines(t, {
+      branch,
+      pagelen: Math.max(limit, PIPELINE_SCAN_WINDOW),
     });
 
-    const out: Array<{ pipeline: BitbucketPipeline; steps: BitbucketStep[] }> = [];
-    for (const pipeline of matching) {
-      const stepsUrl = `${BASE_URL}/repositories/${encode(
-        t.workspace,
-      )}/${encode(t.repo)}/pipelines/${encode(pipeline.uuid)}/steps/`;
-      const stepsPage = await this.#requestJson<BitbucketPage<BitbucketStep>>(stepsUrl);
-      out.push({ pipeline, steps: stepsPage.values });
+    const attributable = candidates.filter(
+      (p) =>
+        p.target?.pullrequest?.id === t.prId || commitMatches(p.target?.commit?.hash, headCommit),
+    );
+
+    if (attributable.length > 0) {
+      return {
+        match: "pr_head_commit",
+        prId: t.prId,
+        branch,
+        commit: headCommit,
+        pipelines: await this.#attachSteps(t, attributable.slice(0, limit), withSteps),
+      };
     }
-    out.sort((a, b) => (a.pipeline.created_on < b.pipeline.created_on ? 1 : -1));
-    return out;
+    if (candidates.length > 0) {
+      return {
+        match: "branch_fallback",
+        prId: t.prId,
+        branch,
+        commit: headCommit,
+        pipelines: await this.#attachSteps(t, candidates.slice(0, limit), withSteps),
+      };
+    }
+    return {
+      match: "none",
+      prId: t.prId,
+      branch,
+      commit: headCommit,
+      pipelines: [],
+    };
+  }
+
+  /**
+   * Triggers a pipeline. Requires the `pipeline:write` OAuth scope.
+   *
+   * `customPipeline` selects a definition from the `custom:` section of
+   * bitbucket-pipelines.yml; without it Bitbucket picks the definition that
+   * matches the branch (`branches:` then `default:`), which is what re-running
+   * a build means.
+   */
+  async triggerPipeline(
+    t: RepoTarget,
+    args: {
+      branch: string;
+      commit?: string;
+      customPipeline?: string;
+      variables?: PipelineVariable[];
+    },
+  ): Promise<BitbucketPipeline> {
+    const target: {
+      type: string;
+      ref_type: string;
+      ref_name: string;
+      commit?: { type: string; hash: string };
+      selector?: { type: string; pattern: string };
+    } = {
+      type: "pipeline_ref_target",
+      ref_type: "branch",
+      ref_name: args.branch,
+    };
+    if (args.commit !== undefined) {
+      target.commit = { type: "commit", hash: args.commit };
+    }
+    if (args.customPipeline !== undefined) {
+      target.selector = { type: "custom", pattern: args.customPipeline };
+    }
+    const body: { target: typeof target; variables?: PipelineVariable[] } = { target };
+    if (args.variables !== undefined && args.variables.length > 0) {
+      body.variables = args.variables;
+    }
+    const url = `${BASE_URL}/repositories/${encode(t.workspace)}/${encode(t.repo)}/pipelines/`;
+    return await this.#requestJson<BitbucketPipeline>(url, {
+      method: "POST",
+      json: body,
+    });
+  }
+
+  /**
+   * Build statuses attached to a commit — Pipelines results plus anything else
+   * that posts a status (deploy jobs, external CI, code scanners).
+   */
+  async getCommitStatuses(
+    t: RepoTarget,
+    commit: string,
+    opts?: { limit?: number },
+  ): Promise<BitbucketCommitStatus[]> {
+    const limit = clampLimit(opts?.limit, DEFAULT_STATUS_LIMIT);
+    const params = new URLSearchParams();
+    params.set("pagelen", String(Math.min(100, limit)));
+    const url = `${BASE_URL}/repositories/${encode(t.workspace)}/${encode(t.repo)}/commit/${encode(
+      commit,
+    )}/statuses?${params.toString()}`;
+    return await this.#paginate<BitbucketCommitStatus>(url, limit);
+  }
+
+  /** Build statuses for a PR's head commit, as Bitbucket resolves it. */
+  async getPrStatuses(t: PrTarget, opts?: { limit?: number }): Promise<BitbucketCommitStatus[]> {
+    const limit = clampLimit(opts?.limit, DEFAULT_STATUS_LIMIT);
+    const params = new URLSearchParams();
+    params.set("pagelen", String(Math.min(100, limit)));
+    const url = `${BASE_URL}/repositories/${encode(t.workspace)}/${encode(
+      t.repo,
+    )}/pullrequests/${t.prId}/statuses?${params.toString()}`;
+    return await this.#paginate<BitbucketCommitStatus>(url, limit);
   }
 
   async getPipelineStepLog(t: RepoTarget, pipelineUuid: string, stepUuid: string): Promise<string> {
+    const pipelineId = normalizePipelineId(pipelineUuid);
+    const stepId = normalizeStepUuid(stepUuid);
     const url = `${BASE_URL}/repositories/${encode(t.workspace)}/${encode(
       t.repo,
-    )}/pipelines/${encode(pipelineUuid)}/steps/${encode(stepUuid)}/log`;
+    )}/pipelines/${encode(pipelineId)}/steps/${encode(stepId)}/log`;
     try {
       return await this.#requestText(url, { accept: "*/*" });
     } catch (err) {
       if (err instanceof BitbucketError && err.status === 404) {
         throw new BitbucketError(
-          `Bitbucket pipeline step has no log available yet (step ${stepUuid}): ${err.body}`,
+          `Bitbucket pipeline step has no log available yet (step ${stepId}): ${err.body}`,
           err.status,
           err.body,
         );
@@ -314,6 +537,44 @@ export class BitbucketClient {
   }
 
   // ---------- Internals ----------
+
+  async #fetchPipelines(
+    t: RepoTarget,
+    opts: { branch?: string; commit?: string; pagelen: number },
+  ): Promise<BitbucketPipeline[]> {
+    const params = new URLSearchParams();
+    if (opts.branch !== undefined) {
+      params.set("target.branch", opts.branch);
+    }
+    if (opts.commit !== undefined) {
+      params.set("target.commit.hash", opts.commit);
+    }
+    params.set("sort", "-created_on");
+    params.set("pagelen", String(Math.min(100, Math.max(1, opts.pagelen))));
+    const url = `${BASE_URL}/repositories/${encode(t.workspace)}/${encode(
+      t.repo,
+    )}/pipelines/?${params.toString()}`;
+    const page = await this.#requestJson<BitbucketPage<BitbucketPipeline>>(url);
+    const values = page.values ?? [];
+    // Bitbucket honours `sort` but be explicit: callers rely on newest-first.
+    return [...values].sort((a, b) => (a.created_on < b.created_on ? 1 : -1));
+  }
+
+  async #attachSteps(
+    t: RepoTarget,
+    pipelines: BitbucketPipeline[],
+    withSteps: boolean,
+  ): Promise<PipelineWithSteps[]> {
+    const out: PipelineWithSteps[] = [];
+    for (const pipeline of pipelines) {
+      if (!withSteps) {
+        out.push({ pipeline, steps: [] });
+        continue;
+      }
+      out.push({ pipeline, steps: await this.listPipelineSteps(t, pipeline.uuid) });
+    }
+    return out;
+  }
 
   async #requestJson<T>(url: string, opts: RequestOptions = {}): Promise<T> {
     const text = await this.#requestText(url, {
@@ -434,6 +695,93 @@ export class BitbucketClient {
 
 function encode(s: string): string {
   return encodeURIComponent(s);
+}
+
+const BARE_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Accepts what people actually have in hand: a braced UUID, a bare UUID, or a
+ * build number (which Bitbucket accepts in the `{pipeline_uuid}` slot).
+ */
+export function normalizePipelineId(id: string): string {
+  const trimmed = id.trim();
+  if (/^\d+$/.test(trimmed)) {
+    return trimmed;
+  }
+  return BARE_UUID.test(trimmed) ? `{${trimmed}}` : trimmed;
+}
+
+/** Step UUIDs must carry the curly braces; add them if the caller omitted them. */
+export function normalizeStepUuid(uuid: string): string {
+  const trimmed = uuid.trim();
+  return BARE_UUID.test(trimmed) ? `{${trimmed}}` : trimmed;
+}
+
+/** True when two commit hashes refer to the same commit, allowing short hashes. */
+function commitMatches(a: string | undefined, b: string | undefined): boolean {
+  if (a === undefined || b === undefined || a.length === 0 || b.length === 0) {
+    return false;
+  }
+  const shorter = a.length <= b.length ? a : b;
+  const longer = a.length <= b.length ? b : a;
+  // Require at least a 7-char prefix so a stray 1-char value can't match.
+  if (shorter.length < 7) {
+    return a.toLowerCase() === b.toLowerCase();
+  }
+  return longer.toLowerCase().startsWith(shorter.toLowerCase());
+}
+
+/**
+ * Keeps only the sections of a unified diff that touch one of `paths`. A path
+ * matches a file exactly, or as a directory prefix (`src/foo` matches
+ * `src/foo/bar.ts`). Content before the first file header is dropped.
+ */
+export function filterDiffByPaths(diff: string, paths: string[]): string {
+  if (paths.length === 0) {
+    return diff;
+  }
+  const wanted = paths.map((p) => p.replace(/^\.\//, "").replace(/\/+$/, ""));
+  const sections: string[] = [];
+  let current: string[] | null = null;
+  let keep = false;
+
+  for (const line of diff.split("\n")) {
+    if (line.startsWith("diff --git ")) {
+      if (current !== null && keep) {
+        sections.push(current.join("\n"));
+      }
+      current = [line];
+      keep = diffHeaderPaths(line).some((filePath) =>
+        wanted.some((w) => filePath === w || filePath.startsWith(`${w}/`)),
+      );
+      continue;
+    }
+    if (current !== null) {
+      current.push(line);
+    }
+  }
+  if (current !== null && keep) {
+    sections.push(current.join("\n"));
+  }
+  const joined = sections.join("\n");
+  if (joined.length === 0 || joined.endsWith("\n")) {
+    return joined;
+  }
+  return `${joined}\n`;
+}
+
+/** Extracts the a/ and b/ paths from a `diff --git a/x b/y` header line. */
+function diffHeaderPaths(header: string): string[] {
+  const rest = header.slice("diff --git ".length).trim();
+  const out: string[] = [];
+  // Quoted paths (git quotes paths containing spaces) and plain ones.
+  const quoted = rest.match(/"(?:[^"\\]|\\.)*"/g);
+  const tokens = quoted !== null && quoted.length === 2 ? quoted : rest.split(/\s+/);
+  for (const token of tokens) {
+    const unquoted = token.startsWith('"') && token.endsWith('"') ? token.slice(1, -1) : token;
+    out.push(unquoted.replace(/^[ab]\//, ""));
+  }
+  return out;
 }
 
 function clampLimit(requested: number | undefined, def: number): number {

@@ -40,6 +40,7 @@ const REQUIRED_SCOPES: readonly string[] = [
   "pullrequest",
   "pullrequest:write",
   "pipeline",
+  "pipeline:write",
 ];
 
 function consumerUrlFor(workspace: string): string {
@@ -64,10 +65,11 @@ function step1Instructions(consumerUrl: string, includePickWorkspaceHint: boolea
     `  Callback URL:                  http://127.0.0.1:${CALLBACK_PORT}/callback`,
     "  ✓ This is a private consumer",
     "",
-    "  Permissions (tick these five):",
+    "  Permissions (tick these):",
     "    ✓ Account        → Read",
     "    ✓ Pull requests  → Write",
-    "    ✓ Pipelines      → Read",
+    "    ✓ Pipelines      → Write (needed to re-run builds; also grants Read)",
+    "    ✓ Pipelines      → Read (should be set because of Pipelines: Write access)",
     "    ✓ Repositories   → Read (should be set because of Pull request: Write access)",
     "    ✓ Repositories   → Write (should be set because of Pull request: Write access)",
     "    ✓ Pull requests  → Read (should be set because of Pull request: Write access)",

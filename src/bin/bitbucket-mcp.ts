@@ -12,6 +12,7 @@ const REQUIRED_SCOPES: readonly string[] = [
   "pullrequest",
   "pullrequest:write",
   "pipeline",
+  "pipeline:write",
 ];
 
 async function main(argv: readonly string[]): Promise<void> {

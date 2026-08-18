@@ -9,12 +9,25 @@ import {
   AuthError,
   BitbucketError,
   type BitbucketComment,
+  type BitbucketCommitStatus,
+  type BitbucketDiffstat,
   type BitbucketPipeline,
   type BitbucketPr,
   type BitbucketStep,
+  type PipelineLookup,
+  type PipelineWithSteps,
   type PrTarget,
   type RepoTarget,
 } from "../types.ts";
+
+// Output caps. Both default to roughly 25k tokens of text, which is what an
+// MCP host will accept in one tool result before spilling it to a file.
+const DEFAULT_DIFF_MAX_BYTES = 100_000;
+const DEFAULT_LOG_MAX_BYTES = 100_000;
+const MAX_OUTPUT_BYTES = 5_000_000;
+
+// Step results that mean "this is the step you want the log for".
+const FAILING_RESULTS = new Set(["FAILED", "ERROR", "STOPPED"]);
 
 // ---------- Public API ----------
 
@@ -22,6 +35,7 @@ export type ServerOptions = {
   client?: BitbucketClient;
   inferRepo?: (cwd?: string) => Promise<RepoTarget | null>;
   getBranch?: (cwd?: string) => Promise<string | null>;
+  getHeadSha?: (cwd?: string) => Promise<string | null>;
   cwd?: string;
 };
 
@@ -43,11 +57,12 @@ export function createServer(opts: ServerOptions = {}): McpServer {
     });
   const inferRepo = opts.inferRepo ?? inferBitbucketRepo;
   const getBranch = opts.getBranch ?? defaultGetBranch;
+  const getHeadSha = opts.getHeadSha ?? defaultGetHeadSha;
   const cwd = opts.cwd ?? process.cwd();
 
   const server = new McpServer({ name: "bitbucket-mcp", version: "0.1.0" });
 
-  const deps: HandlerDeps = { client, inferRepo, getBranch, cwd };
+  const deps: HandlerDeps = { client, inferRepo, getBranch, getHeadSha, cwd };
 
   registerTools(server, deps);
 
@@ -69,6 +84,7 @@ export type HandlerDeps = {
   client: BitbucketClient;
   inferRepo: (cwd?: string) => Promise<RepoTarget | null>;
   getBranch: (cwd?: string) => Promise<string | null>;
+  getHeadSha: (cwd?: string) => Promise<string | null>;
   cwd: string;
 };
 
@@ -232,15 +248,45 @@ export async function handleListPrs(
 
 export async function handleGetPrDiff(
   deps: HandlerDeps,
-  args: { workspace?: string; repo?: string; pr_id?: number },
+  args: {
+    workspace?: string;
+    repo?: string;
+    pr_id?: number;
+    paths?: string[];
+    stat_only?: boolean;
+    max_bytes?: number;
+  },
 ): Promise<ToolResult> {
   return safely(async () => {
     const repo = await resolveRepo(deps, args);
     if (repo === null) return errorResult(NO_REPO_MESSAGE);
     const resolved = await resolvePrTarget(deps, repo, args.pr_id);
     if (!resolved.ok) return errorResult(resolved.error);
-    const diff = await deps.client.getPrDiff(resolved.target);
-    return textResult(diff);
+
+    if (args.stat_only === true) {
+      const stat = await deps.client.getPrDiffStat(resolved.target);
+      return textResult(JSON.stringify(summarizeDiffStat(stat, args.paths), null, 2));
+    }
+
+    const paths = args.paths ?? [];
+    const diff = await deps.client.getPrDiff(resolved.target, {
+      paths: paths.length > 0 ? paths : undefined,
+    });
+    if (diff.length === 0) {
+      const scope = paths.length > 0 ? ` for paths: ${paths.join(", ")}` : "";
+      return textResult(
+        `No diff content${scope}. Use \`stat_only: true\` to list the files this PR changes.`,
+      );
+    }
+    const maxBytes = clampBytes(args.max_bytes, DEFAULT_DIFF_MAX_BYTES);
+    if (diff.length <= maxBytes) {
+      return textResult(diff);
+    }
+    const note =
+      `\n[bitbucket-mcp] Diff truncated: showing the first ${formatBytes(maxBytes)} of ` +
+      `${formatBytes(diff.length)}. Narrow it with \`paths\`, summarize it with ` +
+      `\`stat_only: true\`, or raise \`max_bytes\`.\n`;
+    return textResult(`${diff.slice(0, maxBytes)}${note}`);
   });
 }
 
@@ -263,26 +309,86 @@ export async function handleListPrComments(
   });
 }
 
-export async function handleGetPrPipelineStatus(
+export async function handleListPipelines(
   deps: HandlerDeps,
-  args: { workspace?: string; repo?: string; pr_id?: number },
+  args: {
+    workspace?: string;
+    repo?: string;
+    pr_id?: number;
+    branch?: string;
+    commit?: string;
+    build_number?: number;
+    limit?: number;
+    include_steps?: boolean;
+  },
 ): Promise<ToolResult> {
   return safely(async () => {
     const repo = await resolveRepo(deps, args);
     if (repo === null) return errorResult(NO_REPO_MESSAGE);
-    const resolved = await resolvePrTarget(deps, repo, args.pr_id);
-    if (!resolved.ok) return errorResult(resolved.error);
-    const status = await deps.client.getPrPipelineStatus(resolved.target);
-    const out = status.map((entry) => ({
-      pipeline_uuid: entry.pipeline.uuid,
-      build_number: entry.pipeline.build_number,
-      state: entry.pipeline.state.name,
-      result: entry.pipeline.state.result?.name,
-      created_on: entry.pipeline.created_on,
-      steps: entry.steps.map(stripStep),
-    }));
-    return textResult(JSON.stringify(out, null, 2));
+    const withSteps = args.include_steps ?? true;
+    const limit = args.limit ?? 5;
+
+    const lookup = await resolvePipelineLookup(deps, repo, args, { limit, withSteps });
+    if (!lookup.ok) return errorResult(lookup.error);
+
+    return textResult(JSON.stringify(formatLookup(repo, lookup.value), null, 2));
   });
+}
+
+/** Picks the lookup strategy from whichever scoping argument was supplied. */
+async function resolvePipelineLookup(
+  deps: HandlerDeps,
+  repo: RepoTarget,
+  args: { pr_id?: number; branch?: string; commit?: string; build_number?: number },
+  opts: { limit: number; withSteps: boolean },
+): Promise<{ ok: true; value: PipelineLookup } | { ok: false; error: string }> {
+  if (args.build_number !== undefined) {
+    const entry = await deps.client.getPipeline(repo, String(args.build_number), {
+      withSteps: opts.withSteps,
+    });
+    return { ok: true, value: { match: "build_number", pipelines: [entry] } };
+  }
+  if (args.commit !== undefined) {
+    return {
+      ok: true,
+      value: await deps.client.findPipelinesForCommit(repo, args.commit, {
+        branch: args.branch,
+        limit: opts.limit,
+        withSteps: opts.withSteps,
+      }),
+    };
+  }
+  // An explicit pr_id beats branch: it is the more specific request, and the PR
+  // route derives the branch itself.
+  if (args.branch !== undefined && args.pr_id === undefined) {
+    const pipelines = await deps.client.listPipelines(repo, {
+      branch: args.branch,
+      limit: opts.limit,
+      withSteps: opts.withSteps,
+    });
+    return {
+      ok: true,
+      value: {
+        match: pipelines.length > 0 ? "branch" : "none",
+        branch: args.branch,
+        pipelines,
+      },
+    };
+  }
+  const resolved = await resolvePrTarget(deps, repo, args.pr_id);
+  if (!resolved.ok) {
+    return {
+      ok: false,
+      error: `${resolved.error} Or pass \`branch\`, \`commit\`, or \`build_number\` to look up pipelines without a PR.`,
+    };
+  }
+  return {
+    ok: true,
+    value: await deps.client.findPipelinesForPr(resolved.target, {
+      limit: opts.limit,
+      withSteps: opts.withSteps,
+    }),
+  };
 }
 
 export async function handleGetPipelineStepLog(
@@ -291,14 +397,144 @@ export async function handleGetPipelineStepLog(
     workspace?: string;
     repo?: string;
     pipeline_uuid: string;
-    step_uuid: string;
+    step_uuid?: string;
+    tail_lines?: number;
+    max_bytes?: number;
   },
 ): Promise<ToolResult> {
   return safely(async () => {
     const repo = await resolveRepo(deps, args);
     if (repo === null) return errorResult(NO_REPO_MESSAGE);
-    const log = await deps.client.getPipelineStepLog(repo, args.pipeline_uuid, args.step_uuid);
-    return textResult(log);
+
+    let stepUuid = args.step_uuid;
+    let step: BitbucketStep | undefined;
+    if (stepUuid === undefined) {
+      const steps = await deps.client.listPipelineSteps(repo, args.pipeline_uuid);
+      step = pickInterestingStep(steps);
+      if (step === undefined) {
+        return errorResult(
+          `Pipeline ${args.pipeline_uuid} has no steps yet, so there is no log to read. Use \`list_pipelines\` with \`build_number\` to check its state.`,
+        );
+      }
+      stepUuid = step.uuid;
+    }
+
+    const log = await deps.client.getPipelineStepLog(repo, args.pipeline_uuid, stepUuid);
+    const trimmed = trimLog(log, {
+      tailLines: args.tail_lines,
+      maxBytes: clampBytes(args.max_bytes, DEFAULT_LOG_MAX_BYTES),
+    });
+
+    const header = [
+      `[bitbucket-mcp] pipeline ${args.pipeline_uuid} step ${describeStep(step, stepUuid)}`,
+      trimmed.note,
+    ]
+      .filter((line) => line !== undefined)
+      .join("\n");
+    return textResult(`${header}\n${trimmed.text}`);
+  });
+}
+
+export async function handleGetBuildStatus(
+  deps: HandlerDeps,
+  args: { workspace?: string; repo?: string; commit?: string; pr_id?: number },
+): Promise<ToolResult> {
+  return safely(async () => {
+    const repo = await resolveRepo(deps, args);
+    if (repo === null) return errorResult(NO_REPO_MESSAGE);
+
+    let statuses: BitbucketCommitStatus[];
+    let target: { type: "commit" | "pull_request"; commit?: string; pr_id?: number };
+    if (args.commit !== undefined) {
+      statuses = await deps.client.getCommitStatuses(repo, args.commit);
+      target = { type: "commit", commit: args.commit };
+    } else if (args.pr_id !== undefined) {
+      statuses = await deps.client.getPrStatuses({ ...repo, prId: args.pr_id });
+      target = { type: "pull_request", pr_id: args.pr_id };
+    } else {
+      const head = await deps.getHeadSha(deps.cwd);
+      if (head === null) {
+        return errorResult(
+          "Could not determine a commit to check. Pass `commit` (a SHA) or `pr_id`, or run the MCP from inside a git checkout.",
+        );
+      }
+      statuses = await deps.client.getCommitStatuses(repo, head);
+      target = { type: "commit", commit: head };
+    }
+
+    const verdict = overallVerdict(statuses);
+    const out: {
+      target: typeof target;
+      verdict: string;
+      note?: string;
+      statuses: ReturnType<typeof stripCommitStatus>[];
+    } = {
+      target,
+      verdict,
+      statuses: statuses.map(stripCommitStatus),
+    };
+    if (verdict === "NO_STATUSES") {
+      out.note =
+        "Nothing has posted a build status for this commit. That is not the same as a failed build — a pipeline may have run without publishing a status, so check `list_pipelines` before concluding anything.";
+    }
+    return textResult(JSON.stringify(out, null, 2));
+  });
+}
+
+export async function handleRunPipeline(
+  deps: HandlerDeps,
+  args: {
+    workspace?: string;
+    repo?: string;
+    branch?: string;
+    commit?: string;
+    custom_pipeline?: string;
+    variables?: Array<{ key: string; value: string; secured?: boolean }>;
+  },
+): Promise<ToolResult> {
+  return safely(async () => {
+    const repo = await resolveRepo(deps, args);
+    if (repo === null) return errorResult(NO_REPO_MESSAGE);
+
+    let branch = args.branch;
+    if (branch === undefined) {
+      const current = await deps.getBranch(deps.cwd);
+      if (current === null) {
+        return errorResult(
+          "Could not determine which branch to build. Pass `branch` explicitly, or run the MCP from inside a git checkout.",
+        );
+      }
+      branch = current;
+    }
+
+    let pipeline: BitbucketPipeline;
+    try {
+      pipeline = await deps.client.triggerPipeline(repo, {
+        branch,
+        commit: args.commit,
+        customPipeline: args.custom_pipeline,
+        variables: args.variables,
+      });
+    } catch (err) {
+      if (err instanceof BitbucketError && err.status === 403) {
+        return errorResult(
+          "Bitbucket refused to start the pipeline (403). Triggering pipelines needs the `pipeline:write` OAuth scope — " +
+            "if you set this MCP up before that scope was requested, re-run `bitbucket-mcp setup` to re-authorize. " +
+            `It can also mean you lack write permission on ${branch} (branch restrictions). Bitbucket said: ${err.body}`,
+        );
+      }
+      throw err;
+    }
+
+    const what =
+      args.custom_pipeline !== undefined ? `custom pipeline "${args.custom_pipeline}"` : "pipeline";
+    return textResult(
+      `Started ${what} #${pipeline.build_number} on ${branch}\n${JSON.stringify(
+        stripPipeline(repo, { pipeline, steps: [] }),
+        null,
+        2,
+      )}`,
+    );
   });
 }
 
@@ -539,8 +775,30 @@ function registerTools(server: McpServer, deps: HandlerDeps): void {
     {
       title: "Get PR diff",
       description:
-        "Fetch the unified diff for a pull request. Returns the raw text diff, suitable for reviewing what the PR changes.",
-      inputSchema: { ...workspaceRepoShape, ...prIdShape },
+        "Fetch the unified diff for a pull request. For a large PR, start with `stat_only: true` to see which files changed and how big the diff is, then pass `paths` to fetch only the parts you need. Output is capped at `max_bytes` (default 100 KB) and the tail is dropped with a note when it overflows.",
+      inputSchema: {
+        ...workspaceRepoShape,
+        ...prIdShape,
+        paths: z
+          .array(z.string().min(1))
+          .optional()
+          .describe(
+            "Limit the diff to these files or directories (repo-relative; a directory matches everything under it).",
+          ),
+        stat_only: z
+          .boolean()
+          .optional()
+          .describe(
+            "Return a per-file summary (status, lines added/removed) plus totals instead of the diff text.",
+          ),
+        max_bytes: z
+          .number()
+          .int()
+          .min(1000)
+          .max(MAX_OUTPUT_BYTES)
+          .optional()
+          .describe("Maximum diff bytes to return. Default 100000."),
+      },
       annotations: { title: "Get PR diff", ...READ_ONLY },
     },
     async (args) => handleGetPrDiff(deps, args),
@@ -569,15 +827,43 @@ function registerTools(server: McpServer, deps: HandlerDeps): void {
   );
 
   server.registerTool(
-    "get_pr_pipeline_status",
+    "list_pipelines",
     {
-      title: "Get PR pipeline status",
+      title: "List pipelines",
       description:
-        "Get the status of pipelines triggered by this PR (most recent first), with each step's pass/fail state. Use this to find failing steps; then use `get_pipeline_step_log` to read logs.",
-      inputSchema: { ...workspaceRepoShape, ...prIdShape },
-      annotations: { title: "Get PR pipeline status", ...READ_ONLY },
+        "Find Bitbucket Pipelines builds and their per-step pass/fail state. Scope it with `build_number` (exact build), `commit` (SHA, short or full), `branch`, or `pr_id` — with none of those it uses the PR for the current branch. " +
+        "PR lookups do not require the repo to have a `pull-requests:` trigger: when no pipeline is attributable to the PR, this falls back to the most recent pipelines on the PR's source branch and says so in `match` and `note`. " +
+        '`match: "none"` means no pipeline ran at all — distinct from a fallback. Steps include their UUIDs, so this is where you get the arguments for `get_pipeline_step_log`.',
+      inputSchema: {
+        ...workspaceRepoShape,
+        ...prIdShape,
+        branch: z.string().min(1).optional().describe("Branch name to list pipelines for."),
+        commit: z
+          .string()
+          .min(4)
+          .optional()
+          .describe("Commit SHA (short or full) to find pipelines for."),
+        build_number: z
+          .number()
+          .int()
+          .positive()
+          .optional()
+          .describe("Fetch one specific build by its build number (e.g. 27419)."),
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(50)
+          .optional()
+          .describe("Maximum number of pipelines to return, newest first. Default 5."),
+        include_steps: z
+          .boolean()
+          .optional()
+          .describe("Include each pipeline's steps. Default true; set false for a cheaper answer."),
+      },
+      annotations: { title: "List pipelines", ...READ_ONLY },
     },
-    async (args) => handleGetPrPipelineStatus(deps, args),
+    async (args) => handleListPipelines(deps, args),
   );
 
   server.registerTool(
@@ -585,15 +871,56 @@ function registerTools(server: McpServer, deps: HandlerDeps): void {
     {
       title: "Get pipeline step log",
       description:
-        "Fetch the log output of a specific pipeline step. Use pipeline_uuid and step_uuid from `get_pr_pipeline_status`. Returns plain text log contents.",
+        "Fetch the log output of a pipeline step. `pipeline_uuid` accepts either a pipeline UUID or a plain build number (e.g. 27419); UUIDs work with or without curly braces. " +
+        "Omit `step_uuid` to get the first failed step's log (or the last step when everything passed). Use `tail_lines` when you only need the end of the log — that is where failures are. " +
+        "Output is capped at `max_bytes` (default 100 KB), keeping the end of the log. If you only need whether a step passed, use `list_pipelines` instead — it returns step state without any log.",
       inputSchema: {
         ...workspaceRepoShape,
-        pipeline_uuid: z.string().min(1).describe("Pipeline UUID."),
-        step_uuid: z.string().min(1).describe("Pipeline step UUID."),
+        pipeline_uuid: z.string().min(1).describe("Pipeline UUID or build number."),
+        step_uuid: z
+          .string()
+          .min(1)
+          .optional()
+          .describe("Step UUID. Defaults to the first failed step, else the last step."),
+        tail_lines: z
+          .number()
+          .int()
+          .min(1)
+          .max(100000)
+          .optional()
+          .describe("Return only the last N lines of the log."),
+        max_bytes: z
+          .number()
+          .int()
+          .min(1000)
+          .max(MAX_OUTPUT_BYTES)
+          .optional()
+          .describe("Maximum log bytes to return, keeping the end. Default 100000."),
       },
       annotations: { title: "Get pipeline step log", ...READ_ONLY },
     },
     async (args) => handleGetPipelineStepLog(deps, args),
+  );
+
+  server.registerTool(
+    "get_build_status",
+    {
+      title: "Get build status",
+      description:
+        "Answer \"is this commit green?\" in one call, using Bitbucket's commit build statuses (Pipelines results plus anything else that posts a status). Pass `commit` (a SHA) or `pr_id`; with neither, it uses the current checkout's HEAD. " +
+        "`verdict` is FAILED / INPROGRESS / STOPPED / SUCCESSFUL / NO_STATUSES. NO_STATUSES means nothing posted a status — check `list_pipelines` before concluding a build did not run.",
+      inputSchema: {
+        ...workspaceRepoShape,
+        ...prIdShape,
+        commit: z
+          .string()
+          .min(4)
+          .optional()
+          .describe("Commit SHA. Defaults to the checkout's HEAD."),
+      },
+      annotations: { title: "Get build status", ...READ_ONLY },
+    },
+    async (args) => handleGetBuildStatus(deps, args),
   );
 
   server.registerTool(
@@ -758,6 +1085,57 @@ function registerTools(server: McpServer, deps: HandlerDeps): void {
     },
     async (args) => handleAddPrInlineComment(deps, args),
   );
+
+  server.registerTool(
+    "run_pipeline",
+    {
+      title: "Run pipeline",
+      description:
+        "Start a Bitbucket pipeline — a re-run of a branch's build, or a definition from the `custom:` section of bitbucket-pipelines.yml. " +
+        "`branch` defaults to the current git branch; `commit` pins the build to a specific SHA instead of the branch tip. Consumes build minutes and can deploy, so confirm with the user before running a custom pipeline you did not pick out together. " +
+        "Requires the `pipeline:write` OAuth scope (re-run `bitbucket-mcp setup` if the server was set up before that scope existed).",
+      inputSchema: {
+        ...workspaceRepoShape,
+        branch: z
+          .string()
+          .min(1)
+          .optional()
+          .describe("Branch to build. Defaults to the current git branch."),
+        commit: z
+          .string()
+          .min(7)
+          .optional()
+          .describe("Commit SHA to build. Defaults to the branch tip."),
+        custom_pipeline: z
+          .string()
+          .min(1)
+          .optional()
+          .describe("Name of a definition under `custom:` in bitbucket-pipelines.yml."),
+        variables: z
+          .array(
+            z.object({
+              key: z.string().min(1).describe("Variable name."),
+              value: z.string().describe("Variable value."),
+              secured: z
+                .boolean()
+                .optional()
+                .describe("If true, the value is masked in the build log."),
+            }),
+          )
+          .optional()
+          .describe("Variables to pass to the build."),
+      },
+      annotations: {
+        title: "Run pipeline",
+        readOnlyHint: false,
+        // Starting a build consumes minutes and a custom pipeline may deploy.
+        destructiveHint: true,
+        idempotentHint: false,
+        openWorldHint: true,
+      },
+    },
+    async (args) => handleRunPipeline(deps, args),
+  );
 }
 
 // ---------- Shape-strippers ----------
@@ -829,22 +1207,352 @@ function stripComment(c: BitbucketComment): {
   return out;
 }
 
-function stripStep(step: BitbucketStep): {
+type StrippedStep = {
   uuid: string;
   name: string;
   state: BitbucketStep["state"]["name"];
   result?: string;
+  duration_seconds?: number;
   started_on?: string;
   completed_on?: string;
-} {
-  return {
+  error?: string;
+};
+
+function stripStep(step: BitbucketStep): StrippedStep {
+  const out: StrippedStep = {
     uuid: step.uuid,
     name: step.name,
     state: step.state.name,
     result: step.state.result?.name,
+    duration_seconds: step.duration_in_seconds,
     started_on: step.started_on,
     completed_on: step.completed_on,
   };
+  const error = step.state.result?.error;
+  if (error !== undefined) {
+    out.error = [error.key, error.message].filter((v) => v !== undefined).join(": ");
+  }
+  return out;
+}
+
+type StrippedPipeline = {
+  build_number: number;
+  pipeline_uuid: string;
+  state: BitbucketPipeline["state"]["name"];
+  result?: string;
+  trigger?: string;
+  target?: {
+    ref_name?: string;
+    commit?: string;
+    selector?: string;
+    pull_request_id?: number;
+  };
+  created_on: string;
+  completed_on?: string;
+  // Wall-clock, derived from the timestamps. Distinct from build_seconds_used,
+  // which sums every step and so exceeds wall-clock when steps run in parallel.
+  duration_seconds?: number;
+  build_seconds_used?: number;
+  url: string;
+  steps?: StrippedStep[];
+};
+
+function stripPipeline(repo: RepoTarget, entry: PipelineWithSteps): StrippedPipeline {
+  const p = entry.pipeline;
+  const out: StrippedPipeline = {
+    build_number: p.build_number,
+    pipeline_uuid: p.uuid,
+    state: p.state.name,
+    result: p.state.result?.name,
+    trigger: p.trigger?.name,
+    created_on: p.created_on,
+    completed_on: p.completed_on,
+    duration_seconds: wallClockSeconds(p.created_on, p.completed_on),
+    build_seconds_used: p.build_seconds_used,
+    url: `https://bitbucket.org/${repo.workspace}/${repo.repo}/pipelines/results/${p.build_number}`,
+  };
+  if (p.target !== undefined) {
+    const selector = p.target.selector;
+    out.target = {
+      ref_name: p.target.ref_name,
+      commit: p.target.commit?.hash,
+      selector:
+        selector === undefined
+          ? undefined
+          : [selector.type, selector.pattern].filter((v) => v !== undefined).join(":"),
+      pull_request_id: p.target.pullrequest?.id,
+    };
+  }
+  if (entry.steps.length > 0) {
+    out.steps = entry.steps.map(stripStep);
+  }
+  return out;
+}
+
+/** Seconds between two ISO timestamps, or undefined if either is unusable. */
+function wallClockSeconds(from: string, to: string | undefined): number | undefined {
+  if (to === undefined) {
+    return undefined;
+  }
+  const start = Date.parse(from);
+  const end = Date.parse(to);
+  if (Number.isNaN(start) || Number.isNaN(end) || end < start) {
+    return undefined;
+  }
+  return Math.round((end - start) / 1000);
+}
+
+function stripCommitStatus(status: BitbucketCommitStatus): {
+  key: string;
+  name?: string;
+  state: BitbucketCommitStatus["state"];
+  description?: string;
+  refname?: string;
+  url?: string;
+  updated_on?: string;
+} {
+  return {
+    key: status.key,
+    name: status.name,
+    state: status.state,
+    description: status.description,
+    refname: status.refname,
+    url: status.url,
+    updated_on: status.updated_on,
+  };
+}
+
+// ---------- Pipeline lookup presentation ----------
+
+/**
+ * Renders a lookup as the tool payload. `match` and `note` exist so a caller can
+ * tell "the pipelines below built the branch, not the PR" from "a pipeline ran
+ * for exactly this PR" from "nothing ran at all" — collapsing those into an
+ * empty list is what made pipelines undiscoverable.
+ */
+function formatLookup(
+  repo: RepoTarget,
+  lookup: PipelineLookup,
+): {
+  match: PipelineLookup["match"];
+  note?: string;
+  pr_id?: number;
+  branch?: string;
+  commit?: string;
+  pipelines: Array<StrippedPipeline & { is_requested_commit?: boolean }>;
+} {
+  const wanted = lookup.commit;
+  return {
+    match: lookup.match,
+    note: lookupNote(lookup),
+    pr_id: lookup.prId,
+    branch: lookup.branch,
+    commit: wanted,
+    pipelines: lookup.pipelines.map((entry) => {
+      const stripped = stripPipeline(repo, entry);
+      if (wanted === undefined) {
+        return stripped;
+      }
+      return {
+        ...stripped,
+        is_requested_commit: sameCommit(entry.pipeline.target?.commit?.hash, wanted),
+      };
+    }),
+  };
+}
+
+function lookupNote(lookup: PipelineLookup): string | undefined {
+  const prRef = lookup.prId !== undefined ? `PR #${lookup.prId}` : "the PR";
+  switch (lookup.match) {
+    case "branch_fallback":
+      return (
+        `No pipeline is attributable to ${prRef} (nothing was PR-triggered and nothing built its head commit ` +
+        `${shortSha(lookup.commit)}). These are the most recent pipelines on its source branch ` +
+        `'${lookup.branch ?? "?"}' instead — the usual cause is a bitbucket-pipelines.yml with no ` +
+        "`pull-requests:` section, so every build fires on branch push. Check `is_requested_commit` " +
+        "before treating one of these as this PR's build."
+      );
+    case "none":
+      if (lookup.branch !== undefined) {
+        return (
+          `No pipeline has ever run for branch '${lookup.branch}'` +
+          `${lookup.prId !== undefined ? ` (${prRef})` : ""}. This is not a missing PR trigger — ` +
+          "Bitbucket has no build for this branch at all. Check that Pipelines is enabled for the repo " +
+          "and that the branch matches a section of bitbucket-pipelines.yml."
+        );
+      }
+      return (
+        `No pipeline built commit ${shortSha(lookup.commit)}. Nothing ran for this commit — ` +
+        "try the branch instead, since the pipeline may have run for a different commit on it."
+      );
+    default:
+      return undefined;
+  }
+}
+
+function sameCommit(a: string | undefined, b: string | undefined): boolean {
+  if (a === undefined || b === undefined) {
+    return false;
+  }
+  const shorter = a.length <= b.length ? a : b;
+  const longer = a.length <= b.length ? b : a;
+  return shorter.length >= 7 && longer.toLowerCase().startsWith(shorter.toLowerCase());
+}
+
+function shortSha(sha: string | undefined): string {
+  return sha === undefined ? "(unknown)" : sha.slice(0, 12);
+}
+
+/**
+ * The step whose log a caller almost certainly wants: the first failure, else
+ * the last step that actually started — a step still PENDING has no log yet.
+ */
+function pickInterestingStep(steps: BitbucketStep[]): BitbucketStep | undefined {
+  const failed = steps.find((step) => {
+    const result = step.state.result?.name;
+    return result !== undefined && FAILING_RESULTS.has(result);
+  });
+  if (failed !== undefined) {
+    return failed;
+  }
+  const started = steps.filter((step) => step.started_on !== undefined);
+  return started[started.length - 1] ?? steps[steps.length - 1];
+}
+
+function describeStep(step: BitbucketStep | undefined, stepUuid: string): string {
+  if (step === undefined) {
+    return stepUuid;
+  }
+  const result = step.state.result?.name;
+  const state = result !== undefined ? `${step.state.name}/${result}` : step.state.name;
+  const duration = step.duration_in_seconds !== undefined ? `, ${step.duration_in_seconds}s` : "";
+  return `"${step.name}" ${step.uuid} — ${state}${duration}`;
+}
+
+// ---------- Output size control ----------
+
+/**
+ * Applies `tailLines` then `maxBytes`, keeping the END of the log: a failing
+ * step's useful output is the last few dozen lines, not the dependency install.
+ */
+function trimLog(
+  log: string,
+  opts: { tailLines?: number; maxBytes: number },
+): { text: string; note?: string } {
+  const notes: string[] = [];
+  let text = log;
+
+  if (opts.tailLines !== undefined) {
+    const lines = text.split("\n");
+    // A trailing newline yields a final empty element; don't count it as a line.
+    const hasTrailingNewline = lines[lines.length - 1] === "";
+    const content = hasTrailingNewline ? lines.slice(0, -1) : lines;
+    if (content.length > opts.tailLines) {
+      const kept = content.slice(-opts.tailLines);
+      text = `${kept.join("\n")}${hasTrailingNewline ? "\n" : ""}`;
+      notes.push(`last ${opts.tailLines} of ${content.length} lines`);
+    }
+  }
+
+  if (text.length > opts.maxBytes) {
+    text = text.slice(text.length - opts.maxBytes);
+    notes.push(`last ${formatBytes(opts.maxBytes)} of ${formatBytes(log.length)}`);
+  }
+
+  if (notes.length === 0) {
+    return { text };
+  }
+  return {
+    text,
+    note: `[bitbucket-mcp] Showing ${notes.join("; ")} (raise tail_lines / max_bytes for more).`,
+  };
+}
+
+function summarizeDiffStat(
+  stat: BitbucketDiffstat[],
+  paths?: string[],
+): {
+  files_changed: number;
+  lines_added: number;
+  lines_removed: number;
+  files: Array<{
+    path: string;
+    status: BitbucketDiffstat["status"];
+    lines_added: number;
+    lines_removed: number;
+    old_path?: string;
+  }>;
+} {
+  const files = stat
+    .map((entry) => {
+      const newPath = entry.new?.path;
+      const oldPath = entry.old?.path;
+      const path = newPath ?? oldPath ?? "(unknown)";
+      const out: {
+        path: string;
+        status: BitbucketDiffstat["status"];
+        lines_added: number;
+        lines_removed: number;
+        old_path?: string;
+      } = {
+        path,
+        status: entry.status,
+        lines_added: entry.lines_added ?? 0,
+        lines_removed: entry.lines_removed ?? 0,
+      };
+      if (oldPath !== undefined && oldPath !== newPath) {
+        out.old_path = oldPath;
+      }
+      return out;
+    })
+    .filter((file) => matchesPaths(file.path, paths) || matchesPaths(file.old_path, paths));
+
+  return {
+    files_changed: files.length,
+    lines_added: files.reduce((sum, f) => sum + f.lines_added, 0),
+    lines_removed: files.reduce((sum, f) => sum + f.lines_removed, 0),
+    files,
+  };
+}
+
+function matchesPaths(path: string | undefined, paths?: string[]): boolean {
+  if (paths === undefined || paths.length === 0) {
+    return true;
+  }
+  if (path === undefined) {
+    return false;
+  }
+  return paths.some((raw) => {
+    const wanted = raw.replace(/^\.\//, "").replace(/\/+$/, "");
+    return path === wanted || path.startsWith(`${wanted}/`);
+  });
+}
+
+function overallVerdict(
+  statuses: BitbucketCommitStatus[],
+): "SUCCESSFUL" | "FAILED" | "INPROGRESS" | "STOPPED" | "NO_STATUSES" {
+  if (statuses.length === 0) {
+    return "NO_STATUSES";
+  }
+  const states = new Set(statuses.map((s) => s.state));
+  if (states.has("FAILED")) return "FAILED";
+  if (states.has("INPROGRESS")) return "INPROGRESS";
+  if (states.has("STOPPED")) return "STOPPED";
+  return "SUCCESSFUL";
+}
+
+function clampBytes(requested: number | undefined, def: number): number {
+  if (requested === undefined || !Number.isFinite(requested) || requested <= 0) {
+    return def;
+  }
+  return Math.min(Math.floor(requested), MAX_OUTPUT_BYTES);
+}
+
+function formatBytes(n: number): string {
+  if (n < 1024) {
+    return `${n} B`;
+  }
+  return `${(n / 1024).toFixed(1)} KB`;
 }
 
 // Re-export types so tests in other modules can reference them if needed.
@@ -877,5 +1585,19 @@ function defaultGetBranch(cwd?: string): Promise<string | null> {
         resolve(branch);
       },
     );
+  });
+}
+
+/** Returns the current HEAD commit SHA, or null when there is no checkout. */
+function defaultGetHeadSha(cwd?: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    execFile("git", ["rev-parse", "HEAD"], { cwd: cwd ?? process.cwd() }, (err, stdout) => {
+      if (err !== null) {
+        resolve(null);
+        return;
+      }
+      const sha = stdout.toString().trim();
+      resolve(sha.length > 0 ? sha : null);
+    });
   });
 }

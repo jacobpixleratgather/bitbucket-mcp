@@ -145,7 +145,14 @@ test("authorize throws when credentials are missing", async () => {
     handleAuthorize({
       stdout,
       runAuthorizationFlow: vi.fn(async () =>
-        sampleTokens(["account", "repository", "pullrequest", "pullrequest:write", "pipeline"]),
+        sampleTokens([
+          "account",
+          "repository",
+          "pullrequest",
+          "pullrequest:write",
+          "pipeline",
+          "pipeline:write",
+        ]),
       ) as unknown as typeof import("../auth/index.ts").runAuthorizationFlow,
     }),
   ).rejects.toThrow(/Missing OAuth credentials/);
@@ -156,7 +163,14 @@ test("authorize passes stored credentials and prints granted scopes", async () =
   const stdout = new PassThrough();
   const out = collect(stdout);
   const runAuth = vi.fn(async () =>
-    sampleTokens(["account", "repository", "pullrequest", "pullrequest:write", "pipeline"]),
+    sampleTokens([
+      "account",
+      "repository",
+      "pullrequest",
+      "pullrequest:write",
+      "pipeline",
+      "pipeline:write",
+    ]),
   );
   await handleAuthorize({
     stdout,

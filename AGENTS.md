@@ -6,11 +6,16 @@ This file is the source for `CLAUDE.md` and `.cursor/rules/viteplus.mdc` (both s
 
 ## What this project is
 
-`bitbucket-mcp` is a stdio [Model Context Protocol](https://modelcontextprotocol.io) server for **Bitbucket Cloud**. It exposes 13 tools to MCP hosts (Claude Code, Claude Desktop) for reading PR diffs, reading/writing PR comments (including inline file+line comments), creating PRs, editing the PR Overview (title + description), toggling draft/ready state, resolving and unresolving comment threads, and reading Bitbucket Pipelines step logs.
+`bitbucket-mcp` is a stdio [Model Context Protocol](https://modelcontextprotocol.io) server for **Bitbucket Cloud**. It exposes 15 tools to MCP hosts (Claude Code, Claude Desktop) for reading PR diffs, reading/writing PR comments (including inline file+line comments), creating PRs, editing the PR Overview (title + description), toggling draft/ready state, resolving and unresolving comment threads, finding Pipelines builds and reading their step logs, checking a commit's build status, and triggering a build.
 
 It's distributed on npm as `@mcpkits/bitbucket`. Users run `npx -y @mcpkits/bitbucket setup` once for OAuth + Claude Code registration; the server is then loaded transparently by their MCP host on each invocation.
 
-The design doc is at `docs/superpowers/specs/2026-04-20-bitbucket-mcp-design.md` — read it before making architectural changes.
+The design doc is at `docs/superpowers/specs/2026-04-20-bitbucket-mcp-design.md` — read it before making architectural changes. The pipeline-discovery and output-size behaviour is specified separately in `docs/superpowers/specs/2026-08-18-pipeline-discovery-and-output-limits-design.md`.
+
+Two invariants worth knowing before touching the pipeline or diff paths:
+
+- **Never report "no pipeline" when pipelines exist.** Bitbucket abbreviates a PR's `source.commit.hash` to 12 chars while a pipeline's `target.commit.hash` is the full 40, so commits must be compared by prefix (`commitMatches`), never by string equality — that bug made every PR look like it had no pipeline. `list_pipelines` also falls back to the PR's source branch when nothing is attributable to the PR, and returns a `match` discriminator (`pr_head_commit` / `branch_fallback` / `none`) plus a `note`. An empty list must only ever mean "nothing ran".
+- **Every unbounded response is capped.** PR diffs and step logs both carry a `max_bytes` default and a narrowing argument (`paths`/`stat_only`, `tail_lines`). A truncated response always says so and says how to narrow it.
 
 ## Toolchain — Vite+ only
 
@@ -72,7 +77,7 @@ src/
 ├── auth/                 # OAuth 2.0 flow + token refresh. Uses config/.
 │                         # Runs a short-lived http server on 127.0.0.1 for the
 │                         # OAuth callback during `runAuthorizationFlow`.
-├── server/               # McpServer factory with all 13 tools. CWD-infers
+├── server/               # McpServer factory with all 15 tools. CWD-infers
 │                         # workspace/repo via git/. Resolves pr_id via
 │                         # bitbucket/ + current branch.
 ├── setup/                # Interactive CLI wizard (instructions + prompts).
@@ -98,13 +103,15 @@ Module dependency rule: `config → auth → bitbucket → server → bin`; `git
 3. Register it in the tool list at the bottom of the file.
 4. Add tests for the handler: CWD inference path, explicit args path, error paths.
 5. Update the `README.md` tool table.
-6. Keep the total tool count ≤15. If it exceeds ~15 we should revisit the tool-design pattern.
+6. Keep the total tool count ≤15 — we are at 15, so a new tool means folding an
+   existing one into it (as `list_pipelines` absorbed `get_pr_pipeline_status`)
+   rather than growing the surface.
 
 ## Out of scope (intentionally deferred)
 
 - Bitbucket Server / Data Center (only Cloud).
-- PR-lifecycle writes beyond `create_pr` and `set_pr_draft_state`: `merge_pr`, `decline_pr`, `set_pr_approval`.
-- `retry_pr_pipeline`.
+- `merge_pr` and `set_pr_approval`. This is a standing product decision, not a backlog item: merging into a shared branch and approving someone else's code stay with the human. Don't add them without an explicit decision from the user, and if that decision ever comes, they need hard gating.
+- `decline_pr`.
 - MCPB packaging for non-developer install.
 - Hosted OAuth broker (design doc covers why it was deliberately avoided).
 

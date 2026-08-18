@@ -124,6 +124,7 @@ const FULL_SCOPES: readonly string[] = [
   "pullrequest",
   "pullrequest:write",
   "pipeline",
+  "pipeline:write",
 ];
 
 test("scope warning is printed when a required scope is missing", async () => {

@@ -61,18 +61,37 @@ export type BitbucketComment = {
   } | null;
 };
 
+// Bitbucket reports a handful of terminal results for pipelines and steps.
+// NOT_RUN and EXPIRED only ever appear on steps.
+export type BitbucketResultName =
+  | "SUCCESSFUL"
+  | "FAILED"
+  | "ERROR"
+  | "STOPPED"
+  | "NOT_RUN"
+  | "EXPIRED";
+
 export type BitbucketPipeline = {
   uuid: string;
   build_number: number;
   state: {
-    name: "PENDING" | "IN_PROGRESS" | "COMPLETED";
-    result?: { name: "SUCCESSFUL" | "FAILED" | "ERROR" | "STOPPED" };
+    // PARSING/PAUSED/HALTED are rarer but do occur.
+    name: "PENDING" | "PARSING" | "IN_PROGRESS" | "PAUSED" | "HALTED" | "COMPLETED";
+    result?: { name: BitbucketResultName };
+    stage?: { name?: string };
   };
   created_on: string;
+  completed_on?: string;
+  build_seconds_used?: number;
+  trigger?: { name?: string };
   target?: {
+    ref_type?: string;
     ref_name?: string;
     commit?: { hash: string };
     pullrequest?: { id: number };
+    // Which section of bitbucket-pipelines.yml matched: default, branches,
+    // custom, pull-requests, tags.
+    selector?: { type?: string; pattern?: string };
   };
 };
 
@@ -81,10 +100,71 @@ export type BitbucketStep = {
   name: string;
   state: {
     name: "PENDING" | "READY" | "IN_PROGRESS" | "COMPLETED";
-    result?: { name: "SUCCESSFUL" | "FAILED" | "ERROR" | "STOPPED" };
+    result?: {
+      name: BitbucketResultName;
+      // Present when the step failed for a pipeline-level reason (e.g. a
+      // config error) rather than a non-zero script exit.
+      error?: { key?: string; message?: string };
+    };
   };
   started_on?: string;
   completed_on?: string;
+  duration_in_seconds?: number;
+};
+
+export type PipelineWithSteps = {
+  pipeline: BitbucketPipeline;
+  // Empty when steps were not requested or the pipeline has not expanded yet.
+  steps: BitbucketStep[];
+};
+
+/**
+ * How a pipeline lookup resolved. The distinction matters: `branch_fallback`
+ * means "pipelines exist for the branch but none is attributable to the PR",
+ * while `none` means "no pipeline ran at all". Reporting both as an empty list
+ * is what made pipelines undiscoverable in repos whose bitbucket-pipelines.yml
+ * has no `pull-requests:` trigger.
+ */
+export type PipelineMatch =
+  | "build_number"
+  | "commit"
+  | "pr_head_commit"
+  | "branch_fallback"
+  | "branch"
+  | "none";
+
+export type PipelineLookup = {
+  match: PipelineMatch;
+  pipelines: PipelineWithSteps[];
+  // Whichever of these the lookup was scoped by.
+  branch?: string;
+  commit?: string;
+  prId?: number;
+};
+
+export type BitbucketCommitStatus = {
+  key: string;
+  name?: string;
+  state: "SUCCESSFUL" | "FAILED" | "INPROGRESS" | "STOPPED";
+  description?: string;
+  url?: string;
+  refname?: string;
+  created_on?: string;
+  updated_on?: string;
+};
+
+export type BitbucketDiffstat = {
+  status: "added" | "removed" | "modified" | "renamed";
+  lines_added?: number;
+  lines_removed?: number;
+  old?: { path?: string } | null;
+  new?: { path?: string } | null;
+};
+
+export type PipelineVariable = {
+  key: string;
+  value: string;
+  secured?: boolean;
 };
 
 export class BitbucketError extends Error {
