@@ -51,8 +51,8 @@ export function createServer(opts: ServerOptions = {}): McpServer {
     opts.client ??
     new BitbucketClient({
       getAccessToken: () => getAccessToken(),
-      onForceRefresh: async () => {
-        await forceRefresh();
+      onForceRefresh: async (rejectedToken) => {
+        await forceRefresh({ rejectedToken });
       },
     });
   const inferRepo = opts.inferRepo ?? inferBitbucketRepo;

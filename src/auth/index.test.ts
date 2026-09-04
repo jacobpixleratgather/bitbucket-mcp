@@ -308,6 +308,98 @@ test("forceRefresh: non-2xx clears tokens and throws with body", async () => {
 });
 
 // -----------------------------
+// concurrent refreshes (rotating refresh tokens)
+// -----------------------------
+
+test("two expired callers spend one refresh token, and the loser takes the winner's", async () => {
+  const now = 2_200_000_000_000;
+  await writeConfig({
+    clientKey: "k",
+    clientSecret: "s",
+    tokens: { accessToken: "a1", refreshToken: "r1", expiresAt: now - 1000, scopes: ["account"] },
+  });
+  const bodies: string[] = [];
+  const f = (async (_url: string, init?: RequestInit) => {
+    bodies.push(typeof init?.body === "string" ? init.body : "");
+    // Only the first spend of r1 can succeed; Bitbucket retires it on use.
+    if (bodies.length > 1) {
+      return new Response("invalid_grant: refresh token is invalid", { status: 400 });
+    }
+    await new Promise((r) => setTimeout(r, 30));
+    return new Response(tokenBody({ access_token: "a2", refresh_token: "r2", expires_in: 7200 }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }) as typeof fetch;
+
+  const [first, second] = await Promise.all([
+    getAccessToken({ fetch: f, now: () => now }),
+    getAccessToken({ fetch: f, now: () => now }),
+  ]);
+
+  expect(first).toBe("a2");
+  expect(second).toBe("a2");
+  expect(bodies).toHaveLength(1);
+  const cfg = await readConfig();
+  expect(cfg.tokens?.refreshToken).toBe("r2");
+});
+
+test("a refresh that lost the race keeps the tokens another process stored", async () => {
+  const now = 2_300_000_000_000;
+  await writeConfig({
+    clientKey: "k",
+    clientSecret: "s",
+    tokens: { accessToken: "a1", refreshToken: "r1", expiresAt: now - 1000, scopes: ["account"] },
+  });
+  const winner: StoredTokens = {
+    accessToken: "a2",
+    refreshToken: "r2",
+    expiresAt: now + 7_200_000,
+    scopes: ["account"],
+  };
+  // Bitbucket refuses our spend because someone else got there first - and that
+  // someone stored their pair while our request was in flight.
+  const f = (async () => {
+    await writeConfig({ tokens: winner });
+    return new Response("invalid_grant: refresh token is invalid", { status: 400 });
+  }) as typeof fetch;
+
+  const token = await getAccessToken({ fetch: f, now: () => now });
+  expect(token).toBe("a2");
+  const cfg = await readConfig();
+  expect(cfg.tokens?.refreshToken).toBe("r2");
+});
+
+test("forceRefresh does not rotate again when disk holds a token the server never refused", async () => {
+  const now = 2_400_000_000_000;
+  await writeConfig({
+    clientKey: "k",
+    clientSecret: "s",
+    tokens: { accessToken: "a1", refreshToken: "r1", expiresAt: now + 7_200_000, scopes: [] },
+  });
+  const bodies: string[] = [];
+  const f = (async (_url: string, init?: RequestInit) => {
+    bodies.push(typeof init?.body === "string" ? init.body : "");
+    if (bodies.length > 1) {
+      return new Response("invalid_grant", { status: 400 });
+    }
+    await new Promise((r) => setTimeout(r, 30));
+    return new Response(tokenBody({ access_token: "a2", refresh_token: "r2", expires_in: 7200 }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }) as typeof fetch;
+
+  const [first, second] = await Promise.all([
+    forceRefresh({ rejectedToken: "a1", fetch: f, now: () => now }),
+    forceRefresh({ rejectedToken: "a1", fetch: f, now: () => now }),
+  ]);
+  expect(first).toBe("a2");
+  expect(second).toBe("a2");
+  expect(bodies).toHaveLength(1);
+});
+
+// -----------------------------
 // runAuthorizationFlow
 // -----------------------------
 

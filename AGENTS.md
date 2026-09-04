@@ -12,9 +12,10 @@ It's distributed on npm as `@mcpkits/bitbucket`. Users run `npx -y @mcpkits/bitb
 
 The design doc is at `docs/superpowers/specs/2026-04-20-bitbucket-mcp-design.md` — read it before making architectural changes. The pipeline-discovery and output-size behaviour is specified separately in `docs/superpowers/specs/2026-08-18-pipeline-discovery-and-output-limits-design.md`.
 
-Two invariants worth knowing before touching the pipeline or diff paths:
+Three invariants worth knowing before touching the auth, pipeline or diff paths:
 
 - **Never report "no pipeline" when pipelines exist.** Bitbucket abbreviates a PR's `source.commit.hash` to 12 chars while a pipeline's `target.commit.hash` is the full 40, so commits must be compared by prefix (`commitMatches`), never by string equality — that bug made every PR look like it had no pipeline. `list_pipelines` also falls back to the PR's source branch when nothing is attributable to the PR, and returns a `match` discriminator (`pr_head_commit` / `branch_fallback` / `none`) plus a `note`. An empty list must only ever mean "nothing ran".
+- **The refresh token rotates, so credentials are shared state.** Spending a refresh token retires it, and the config file is the only copy - other server processes and scripts that borrow these credentials (the webapp's `pr-dash`) read and write the same file. Every refresh therefore runs under `withRefreshLock`, spends the newest refresh token on disk rather than the one read before queueing, and takes a pair another process stored instead of rotating again. A failed refresh only clears the tokens when the token on disk is still the one that just failed: a refresh token that changed underneath us means someone else's refresh succeeded, and wiping it would log every session out over a lost race.
 - **Every unbounded response is capped.** PR diffs and step logs both carry a `max_bytes` default and a narrowing argument (`paths`/`stat_only`, `tail_lines`). A truncated response always says so and says how to narrow it.
 
 ## Toolchain — Vite+ only

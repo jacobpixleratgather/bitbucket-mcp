@@ -54,13 +54,13 @@ type BitbucketPage<T> = {
 
 export type BitbucketClientOptions = {
   getAccessToken: TokenProvider;
-  onForceRefresh?: () => Promise<void>;
+  onForceRefresh?: (rejectedToken?: string) => Promise<void>;
   fetch?: FetchLike;
 };
 
 export class BitbucketClient {
   readonly #getAccessToken: TokenProvider;
-  readonly #onForceRefresh: (() => Promise<void>) | undefined;
+  readonly #onForceRefresh: ((rejectedToken?: string) => Promise<void>) | undefined;
   readonly #fetch: FetchLike;
 
   constructor(opts: BitbucketClientOptions) {
@@ -599,8 +599,12 @@ export class BitbucketClient {
     const method = opts.method ?? "GET";
     const accept = opts.accept ?? "application/json";
 
+    // The token of the attempt in flight, so a 401 can say which one Bitbucket
+    // refused and the refresh can skip rotating if disk already holds another.
+    let sentToken: string | undefined;
     const buildHeaders = async (): Promise<Record<string, string>> => {
       const token = await this.#getAccessToken();
+      sentToken = token;
       const h: Record<string, string> = {
         Authorization: `Bearer ${token}`,
         Accept: accept,
@@ -635,7 +639,7 @@ export class BitbucketClient {
       if (res.status === 401) {
         if (!didForceRefresh && this.#onForceRefresh !== undefined) {
           didForceRefresh = true;
-          await this.#onForceRefresh();
+          await this.#onForceRefresh(sentToken);
           // Retry once with freshly obtained token.
           continue;
         }

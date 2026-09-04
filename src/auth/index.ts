@@ -3,6 +3,7 @@ import * as http from "node:http";
 import type { AddressInfo } from "node:net";
 import open from "open";
 import { clearTokens, readConfig, writeConfig } from "../config/index.ts";
+import { withRefreshLock } from "../config/lock.ts";
 import { AuthError, type StoredTokens } from "../types.ts";
 
 const TOKEN_URL = "https://bitbucket.org/site/oauth2/access_token";
@@ -51,6 +52,9 @@ export async function getAccessToken(opts?: {
     clientKey: cfg.clientKey,
     clientSecret: cfg.clientSecret,
     refreshToken: tokens.refreshToken,
+    // A token another process stored while we queued is only worth taking if it
+    // outlives the safety margin, exactly like the one we started with.
+    accept: (t) => t.expiresAt - now() > REFRESH_SAFETY_MARGIN_MS,
     fetch: fetchImpl,
     now,
   });
@@ -60,8 +64,13 @@ export async function getAccessToken(opts?: {
 /**
  * Forces a refresh regardless of current expiry. Used after a 401 response
  * from Bitbucket to invalidate a cached-but-rejected token.
+ *
+ * `rejectedToken` is the access token Bitbucket just refused. If another
+ * process has since stored a different one, that token is worth a try and
+ * spending another refresh token is not.
  */
 export async function forceRefresh(opts?: {
+  rejectedToken?: string;
   fetch?: FetchLike;
   now?: () => number;
 }): Promise<string> {
@@ -76,10 +85,12 @@ export async function forceRefresh(opts?: {
     throw new AuthError("Missing OAuth credentials. Re-run `bitbucket-mcp setup`.");
   }
 
+  const rejected = opts?.rejectedToken ?? cfg.tokens.accessToken;
   const refreshed = await refreshTokens({
     clientKey: cfg.clientKey,
     clientSecret: cfg.clientSecret,
     refreshToken: cfg.tokens.refreshToken,
+    accept: (t) => t.accessToken !== rejected && t.expiresAt - now() > 0,
     fetch: fetchImpl,
     now,
   });
@@ -328,38 +339,75 @@ async function exchangeCode(p: {
   return tokens;
 }
 
+/**
+ * Spends a refresh token for a new pair and stores it.
+ *
+ * Bitbucket's refresh tokens rotate, so this is destructive: the token in
+ * `p.refreshToken` is dead the moment Bitbucket answers, and only what we store
+ * can be used again. Two consequences shape everything here.
+ *
+ * The refresh is taken under the shared lock, and once inside we re-read the
+ * config: whoever held the lock before us has probably just stored a usable
+ * pair, and taking theirs is both free and one rotation cheaper than another
+ * round trip.
+ *
+ * On failure the config is re-read again before anything is deleted. A refresh
+ * token that changed underneath us means another process spent ours and stored
+ * its replacement while our request was in flight - our call lost a race, but
+ * the credentials on disk are live, and wiping them would log the user out of
+ * every session for no reason.
+ */
 async function refreshTokens(p: {
   clientKey: string;
   clientSecret: string;
   refreshToken: string;
+  accept: (tokens: StoredTokens) => boolean;
   fetch: FetchLike;
   now: () => number;
 }): Promise<StoredTokens> {
-  const body = new URLSearchParams();
-  body.set("grant_type", "refresh_token");
-  body.set("refresh_token", p.refreshToken);
+  return await withRefreshLock(async () => {
+    const cfg = await readConfig();
+    const stored = cfg.tokens;
+    if (stored !== undefined && stored.refreshToken !== p.refreshToken && p.accept(stored)) {
+      return stored;
+    }
+    // Always spend the newest refresh token on disk, never the copy we read
+    // before queueing for the lock.
+    const refreshToken = stored?.refreshToken ?? p.refreshToken;
 
-  const response = await p.fetch(TOKEN_URL, {
-    method: "POST",
-    headers: {
-      "content-type": "application/x-www-form-urlencoded",
-      authorization: basicAuthHeader(p.clientKey, p.clientSecret),
-    },
-    body: body.toString(),
+    const body = new URLSearchParams();
+    body.set("grant_type", "refresh_token");
+    body.set("refresh_token", refreshToken);
+
+    const response = await p.fetch(TOKEN_URL, {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-www-form-urlencoded",
+        authorization: basicAuthHeader(
+          cfg.clientKey ?? p.clientKey,
+          cfg.clientSecret ?? p.clientSecret,
+        ),
+      },
+      body: body.toString(),
+    });
+
+    if (!response.ok) {
+      const text = await safeReadText(response);
+      const after = (await readConfig()).tokens;
+      if (after !== undefined && after.refreshToken !== refreshToken) {
+        return after;
+      }
+      await clearTokens();
+      throw new AuthError(
+        `Refresh failed (${response.status}). Re-run \`bitbucket-mcp authorize\`. ${text}`.trim(),
+      );
+    }
+
+    const parsed = (await response.json()) as TokenResponse;
+    const tokens = toStoredTokens(parsed, p.now);
+    await writeConfig({ tokens });
+    return tokens;
   });
-
-  if (!response.ok) {
-    const text = await safeReadText(response);
-    await clearTokens();
-    throw new AuthError(
-      `Refresh failed (${response.status}). Re-run \`bitbucket-mcp setup\`. ${text}`.trim(),
-    );
-  }
-
-  const parsed = (await response.json()) as TokenResponse;
-  const tokens = toStoredTokens(parsed, p.now);
-  await writeConfig({ tokens });
-  return tokens;
 }
 
 function toStoredTokens(r: TokenResponse, now: () => number): StoredTokens {
